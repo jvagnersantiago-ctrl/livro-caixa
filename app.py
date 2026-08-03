@@ -30,9 +30,9 @@ def _hash_senha(senha: str) -> str:
 
 
 USUARIOS = {
-    "admin": _hash_senha("Cobra611*"),
+    "admin": _hash_senha("admin123"),
     # TROCAR ANTES DE USAR: nome de usuário e senha reais da sua esposa.
-    "usuario_2": _hash_senha("kj071784"),
+    "usuario_2": _hash_senha("troque-esta-senha"),
 }
 
 
@@ -66,6 +66,7 @@ if not st.session_state["autenticado"]:
 # ---- A partir daqui, o usuário já está autenticado ----
 
 conn = db.get_connection()
+db.inicializar_banco(conn)
 
 FORMAS_PAGAMENTO = [
     "Pix", "Dinheiro", "Cartão de Crédito", "Cartão de Débito",
