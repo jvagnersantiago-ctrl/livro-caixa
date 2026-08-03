@@ -7,6 +7,102 @@ import sqlite3
 
 DB_PATH = "livro_caixa.db"
 
+# ---------------------------------------------------------------------
+# Schema embutido (não depende de um arquivo .sql separado existir no
+# mesmo diretório no servidor — reduz uma fonte de erro no deploy).
+# Todo CREATE usa IF NOT EXISTS: rodar isso de novo num banco que já
+# existe não apaga nem duplica nada.
+# ---------------------------------------------------------------------
+SCHEMA_SQL = """
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS Clientes (
+    id_cliente      INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome            TEXT,
+    cpf             TEXT UNIQUE,
+    telefone        TEXT,
+    email           TEXT,
+    observacoes     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS Plano_Contas (
+    id_conta        INTEGER PRIMARY KEY AUTOINCREMENT,
+    codigo          TEXT NOT NULL UNIQUE,
+    nome            TEXT NOT NULL,
+    id_pai          INTEGER,
+    natureza        TEXT NOT NULL CHECK (natureza IN ('Receita', 'Despesa')),
+    FOREIGN KEY (id_pai) REFERENCES Plano_Contas(id_conta)
+);
+
+CREATE TABLE IF NOT EXISTS Lancamentos (
+    id_lancamento       INTEGER PRIMARY KEY AUTOINCREMENT,
+    data                TEXT NOT NULL,
+    tipo                TEXT NOT NULL CHECK (tipo IN ('Entrada', 'Saída')),
+    valor               REAL NOT NULL CHECK (valor > 0),
+    forma_pagamento     TEXT,
+    descricao           TEXT,
+    id_cliente          INTEGER,
+    id_conta_plano      INTEGER NOT NULL,
+    id_transacao_banco  TEXT,
+    criado_em           TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (id_cliente)     REFERENCES Clientes(id_cliente),
+    FOREIGN KEY (id_conta_plano) REFERENCES Plano_Contas(id_conta)
+);
+
+CREATE INDEX IF NOT EXISTS idx_lancamentos_data     ON Lancamentos(data);
+CREATE INDEX IF NOT EXISTS idx_lancamentos_conta    ON Lancamentos(id_conta_plano);
+CREATE INDEX IF NOT EXISTS idx_lancamentos_cliente  ON Lancamentos(id_cliente);
+
+CREATE TABLE IF NOT EXISTS Contas_Pagar_Receber (
+    id_conta_pr     INTEGER PRIMARY KEY AUTOINCREMENT,
+    tipo            TEXT NOT NULL CHECK (tipo IN ('Pagar', 'Receber')),
+    id_cliente      INTEGER,
+    id_conta_plano  INTEGER NOT NULL,
+    descricao       TEXT,
+    valor           REAL NOT NULL CHECK (valor > 0),
+    data_vencimento TEXT NOT NULL,
+    data_pagamento  TEXT,
+    status          TEXT NOT NULL DEFAULT 'Pendente' CHECK (status IN ('Pendente', 'Pago', 'Atrasado')),
+    FOREIGN KEY (id_cliente)     REFERENCES Clientes(id_cliente),
+    FOREIGN KEY (id_conta_plano) REFERENCES Plano_Contas(id_conta)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cpr_vencimento ON Contas_Pagar_Receber(data_vencimento);
+CREATE INDEX IF NOT EXISTS idx_cpr_status     ON Contas_Pagar_Receber(status);
+
+CREATE VIEW IF NOT EXISTS vw_contas_pagar_receber_status_real AS
+SELECT
+    c.*,
+    CASE
+        WHEN c.status = 'Pago' THEN 'Pago'
+        WHEN c.status = 'Pendente' AND date(c.data_vencimento) < date('now') THEN 'Atrasado'
+        ELSE c.status
+    END AS status_real
+FROM Contas_Pagar_Receber c;
+"""
+
+# (codigo, nome, codigo_pai_ou_None, natureza) — pais sempre antes dos filhos.
+PLANO_CONTAS_PADRAO = [
+    ("1",   "Receitas",                    None, "Receita"),
+    ("1.1", "Receitas de Serviços",        "1",  "Receita"),
+    ("1.2", "Receitas de Vendas",          "1",  "Receita"),
+    ("1.3", "Outras Receitas",             "1",  "Receita"),
+    ("2",   "Despesas Fixas",              None, "Despesa"),
+    ("2.1", "Aluguel",                     "2",  "Despesa"),
+    ("2.2", "Salários e Pró-labore",       "2",  "Despesa"),
+    ("2.3", "Contabilidade",               "2",  "Despesa"),
+    ("2.4", "Assinaturas e Softwares",     "2",  "Despesa"),
+    ("3",   "Despesas Variáveis",          None, "Despesa"),
+    ("3.1", "Marketing e Publicidade",     "3",  "Despesa"),
+    ("3.2", "Materiais e Insumos",         "3",  "Despesa"),
+    ("3.3", "Comissões",                   "3",  "Despesa"),
+    ("3.4", "Manutenção",                  "3",  "Despesa"),
+    ("4",   "Impostos",                    None, "Despesa"),
+    ("4.1", "DAS (Simples Nacional / MEI)", "4", "Despesa"),
+    ("4.2", "ISS",                         "4",  "Despesa"),
+    ("4.3", "IRPJ/CSLL",                   "4",  "Despesa"),
+]
+
 
 def get_connection() -> sqlite3.Connection:
     """
@@ -18,6 +114,31 @@ def get_connection() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def inicializar_banco(conn: sqlite3.Connection) -> None:
+    """
+    Garante que a estrutura do banco existe. Idempotente e segura de
+    chamar em toda inicialização do app (local ou na nuvem):
+    - cria tabelas/índices/view só se ainda não existirem;
+    - só insere o Plano de Contas padrão se a tabela estiver vazia
+      (não duplica se já tiver dados, inclusive contas customizadas
+      que o usuário tenha criado no Gerenciador do Plano de Contas).
+    """
+    conn.executescript(SCHEMA_SQL)
+
+    (qtd_contas,) = conn.execute("SELECT COUNT(*) FROM Plano_Contas").fetchone()
+    if qtd_contas == 0:
+        codigo_para_id: dict[str, int] = {}
+        cur = conn.cursor()
+        for codigo, nome, codigo_pai, natureza in PLANO_CONTAS_PADRAO:
+            id_pai = codigo_para_id.get(codigo_pai) if codigo_pai else None
+            cur.execute(
+                "INSERT INTO Plano_Contas (codigo, nome, id_pai, natureza) VALUES (?, ?, ?, ?)",
+                (codigo, nome, id_pai, natureza),
+            )
+            codigo_para_id[codigo] = cur.lastrowid
+        conn.commit()
 
 
 # ---------------------------------------------------------------------
