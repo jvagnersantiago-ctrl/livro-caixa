@@ -1,296 +1,183 @@
 """
-Camada de acesso ao banco de dados livro_caixa.db.
-Mantém toda a lógica de SQL separada da interface Streamlit.
+Camada de acesso a dados do Livro Caixa, agora falando com o Supabase
+(PostgreSQL) via API REST (postgrest), através da lib st-supabase-connection.
+
+Diferença importante em relação à versão SQLite: não existe SQL arbitrário
+aqui (a API REST não aceita isso). Consultas que antes eram uma CTE
+recursiva ou usavam strftime() agora buscam os dados brutos e fazem a
+agregação em Python — o Plano de Contas inteiro cabe tranquilamente em
+memória (poucas dezenas de linhas), então isso não é gargalo de
+performance, é só uma forma diferente de resolver o mesmo problema.
+
+Todas as leituras usam ttl=0 (cache desligado) de propósito: um
+lançamento que acabou de ser gravado precisa aparecer imediatamente no
+histórico, na DRE e no Dashboard — cache de resultado atrapalharia isso.
 """
 
-import sqlite3
+from __future__ import annotations
 
-DB_PATH = "livro_caixa.db"
-
-# ---------------------------------------------------------------------
-# Schema embutido (não depende de um arquivo .sql separado existir no
-# mesmo diretório no servidor — reduz uma fonte de erro no deploy).
-# Todo CREATE usa IF NOT EXISTS: rodar isso de novo num banco que já
-# existe não apaga nem duplica nada.
-# ---------------------------------------------------------------------
-SCHEMA_SQL = """
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS Clientes (
-    id_cliente      INTEGER PRIMARY KEY AUTOINCREMENT,
-    nome            TEXT,
-    cpf             TEXT UNIQUE,
-    telefone        TEXT,
-    email           TEXT,
-    observacoes     TEXT
-);
-
-CREATE TABLE IF NOT EXISTS Plano_Contas (
-    id_conta        INTEGER PRIMARY KEY AUTOINCREMENT,
-    codigo          TEXT NOT NULL UNIQUE,
-    nome            TEXT NOT NULL,
-    id_pai          INTEGER,
-    natureza        TEXT NOT NULL CHECK (natureza IN ('Receita', 'Despesa')),
-    FOREIGN KEY (id_pai) REFERENCES Plano_Contas(id_conta)
-);
-
-CREATE TABLE IF NOT EXISTS Lancamentos (
-    id_lancamento       INTEGER PRIMARY KEY AUTOINCREMENT,
-    data                TEXT NOT NULL,
-    tipo                TEXT NOT NULL CHECK (tipo IN ('Entrada', 'Saída')),
-    valor               REAL NOT NULL CHECK (valor > 0),
-    forma_pagamento     TEXT,
-    descricao           TEXT,
-    id_cliente          INTEGER,
-    id_conta_plano      INTEGER NOT NULL,
-    id_transacao_banco  TEXT,
-    criado_em           TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (id_cliente)     REFERENCES Clientes(id_cliente),
-    FOREIGN KEY (id_conta_plano) REFERENCES Plano_Contas(id_conta)
-);
-
-CREATE INDEX IF NOT EXISTS idx_lancamentos_data     ON Lancamentos(data);
-CREATE INDEX IF NOT EXISTS idx_lancamentos_conta    ON Lancamentos(id_conta_plano);
-CREATE INDEX IF NOT EXISTS idx_lancamentos_cliente  ON Lancamentos(id_cliente);
-
-CREATE TABLE IF NOT EXISTS Contas_Pagar_Receber (
-    id_conta_pr     INTEGER PRIMARY KEY AUTOINCREMENT,
-    tipo            TEXT NOT NULL CHECK (tipo IN ('Pagar', 'Receber')),
-    id_cliente      INTEGER,
-    id_conta_plano  INTEGER NOT NULL,
-    descricao       TEXT,
-    valor           REAL NOT NULL CHECK (valor > 0),
-    data_vencimento TEXT NOT NULL,
-    data_pagamento  TEXT,
-    status          TEXT NOT NULL DEFAULT 'Pendente' CHECK (status IN ('Pendente', 'Pago', 'Atrasado')),
-    FOREIGN KEY (id_cliente)     REFERENCES Clientes(id_cliente),
-    FOREIGN KEY (id_conta_plano) REFERENCES Plano_Contas(id_conta)
-);
-
-CREATE INDEX IF NOT EXISTS idx_cpr_vencimento ON Contas_Pagar_Receber(data_vencimento);
-CREATE INDEX IF NOT EXISTS idx_cpr_status     ON Contas_Pagar_Receber(status);
-
-CREATE VIEW IF NOT EXISTS vw_contas_pagar_receber_status_real AS
-SELECT
-    c.*,
-    CASE
-        WHEN c.status = 'Pago' THEN 'Pago'
-        WHEN c.status = 'Pendente' AND date(c.data_vencimento) < date('now') THEN 'Atrasado'
-        ELSE c.status
-    END AS status_real
-FROM Contas_Pagar_Receber c;
-"""
-
-# (codigo, nome, codigo_pai_ou_None, natureza) — pais sempre antes dos filhos.
-PLANO_CONTAS_PADRAO = [
-    ("1",   "Receitas",                    None, "Receita"),
-    ("1.1", "Receitas de Serviços",        "1",  "Receita"),
-    ("1.2", "Receitas de Vendas",          "1",  "Receita"),
-    ("1.3", "Outras Receitas",             "1",  "Receita"),
-    ("2",   "Despesas Fixas",              None, "Despesa"),
-    ("2.1", "Aluguel",                     "2",  "Despesa"),
-    ("2.2", "Salários e Pró-labore",       "2",  "Despesa"),
-    ("2.3", "Contabilidade",               "2",  "Despesa"),
-    ("2.4", "Assinaturas e Softwares",     "2",  "Despesa"),
-    ("3",   "Despesas Variáveis",          None, "Despesa"),
-    ("3.1", "Marketing e Publicidade",     "3",  "Despesa"),
-    ("3.2", "Materiais e Insumos",         "3",  "Despesa"),
-    ("3.3", "Comissões",                   "3",  "Despesa"),
-    ("3.4", "Manutenção",                  "3",  "Despesa"),
-    ("4",   "Impostos",                    None, "Despesa"),
-    ("4.1", "DAS (Simples Nacional / MEI)", "4", "Despesa"),
-    ("4.2", "ISS",                         "4",  "Despesa"),
-    ("4.3", "IRPJ/CSLL",                   "4",  "Despesa"),
-]
+import streamlit as st
+from postgrest import APIError  # noqa: F401 (reexportado pra uso no app.py)
+from st_supabase_connection import SupabaseConnection, execute_query
 
 
-def get_connection() -> sqlite3.Connection:
+def get_connection():
     """
-    Abre uma conexão com o banco. check_same_thread=False é necessário
-    porque o Streamlit pode acessar a conexão em threads diferentes
-    entre reruns do app.
+    st.connection já cacheia o client em si (não a query) — chamar isso
+    de novo em todo rerun do Streamlit é barato e seguro.
     """
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def inicializar_banco(conn: sqlite3.Connection) -> None:
-    """
-    Garante que a estrutura do banco existe. Idempotente e segura de
-    chamar em toda inicialização do app (local ou na nuvem):
-    - cria tabelas/índices/view só se ainda não existirem;
-    - só insere o Plano de Contas padrão se a tabela estiver vazia
-      (não duplica se já tiver dados, inclusive contas customizadas
-      que o usuário tenha criado no Gerenciador do Plano de Contas).
-    """
-    conn.executescript(SCHEMA_SQL)
-
-    (qtd_contas,) = conn.execute("SELECT COUNT(*) FROM Plano_Contas").fetchone()
-    if qtd_contas == 0:
-        codigo_para_id: dict[str, int] = {}
-        cur = conn.cursor()
-        for codigo, nome, codigo_pai, natureza in PLANO_CONTAS_PADRAO:
-            id_pai = codigo_para_id.get(codigo_pai) if codigo_pai else None
-            cur.execute(
-                "INSERT INTO Plano_Contas (codigo, nome, id_pai, natureza) VALUES (?, ?, ?, ?)",
-                (codigo, nome, id_pai, natureza),
-            )
-            codigo_para_id[codigo] = cur.lastrowid
-        conn.commit()
+    return st.connection("supabase_connection", type=SupabaseConnection, ttl=None)
 
 
 # ---------------------------------------------------------------------
 # Clientes
 # ---------------------------------------------------------------------
 
-def listar_clientes(conn: sqlite3.Connection):
-    return conn.execute(
-        """
-        SELECT id_cliente, nome, cpf, telefone, email, observacoes
-        FROM Clientes
-        ORDER BY nome
-        """
-    ).fetchall()
+def listar_clientes(conn):
+    resp = execute_query(
+        conn.table("clientes")
+        .select("id_cliente, nome, cpf, telefone, email, observacoes")
+        .order("nome"),
+        ttl=0,
+    )
+    return resp.data
 
 
 def inserir_cliente(conn, nome, cpf, telefone, email, observacoes) -> None:
-    conn.execute(
-        """
-        INSERT INTO Clientes (nome, cpf, telefone, email, observacoes)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (nome, cpf, telefone, email, observacoes),
+    execute_query(
+        conn.table("clientes").insert(
+            {
+                "nome": nome,
+                "cpf": cpf,
+                "telefone": telefone,
+                "email": email,
+                "observacoes": observacoes,
+            }
+        ),
+        ttl=0,
     )
-    conn.commit()
 
 
-def buscar_cliente_por_id(conn: sqlite3.Connection, id_cliente: int):
-    return conn.execute(
-        """
-        SELECT id_cliente, nome, cpf, telefone, email, observacoes
-        FROM Clientes
-        WHERE id_cliente = ?
-        """,
-        (id_cliente,),
-    ).fetchone()
+def buscar_cliente_por_id(conn, id_cliente: int):
+    resp = execute_query(
+        conn.table("clientes").select("*").eq("id_cliente", id_cliente), ttl=0
+    )
+    return resp.data[0] if resp.data else None
 
 
 def atualizar_cliente(conn, id_cliente, nome, cpf, telefone, email, observacoes) -> None:
-    conn.execute(
-        """
-        UPDATE Clientes
-        SET nome = ?, cpf = ?, telefone = ?, email = ?, observacoes = ?
-        WHERE id_cliente = ?
-        """,
-        (nome, cpf, telefone, email, observacoes, id_cliente),
+    execute_query(
+        conn.table("clientes")
+        .update(
+            {
+                "nome": nome,
+                "cpf": cpf,
+                "telefone": telefone,
+                "email": email,
+                "observacoes": observacoes,
+            }
+        )
+        .eq("id_cliente", id_cliente),
+        ttl=0,
     )
-    conn.commit()
 
 
-def excluir_cliente(conn: sqlite3.Connection, id_cliente: int) -> None:
-    """
-    Levanta sqlite3.IntegrityError se houver Lancamentos ou
-    Contas_Pagar_Receber vinculados a este cliente — a FK bloqueia de
-    propósito, não fazemos SET NULL automático nem cascata.
-    """
-    conn.execute("DELETE FROM Clientes WHERE id_cliente = ?", (id_cliente,))
-    conn.commit()
+def excluir_cliente(conn, id_cliente: int) -> None:
+    """Levanta postgrest.APIError (code 23503) se houver Lançamentos ou
+    Contas_Pagar_Receber vinculados a este cliente — sem SET NULL nem
+    cascata, de propósito."""
+    execute_query(conn.table("clientes").delete().eq("id_cliente", id_cliente), ttl=0)
 
 
 # ---------------------------------------------------------------------
 # Plano de Contas
 # ---------------------------------------------------------------------
 
-def listar_plano_contas_folhas(conn: sqlite3.Connection):
-    """
-    Retorna apenas as contas 'folha' (sem filhos) do Plano de Contas.
-    Lançamentos só devem ser vinculados a contas-folha — vincular a uma
-    conta-pai quebra a soma hierárquica usada em relatórios.
-    """
-    return conn.execute(
-        """
-        SELECT id_conta, codigo, nome
-        FROM Plano_Contas
-        WHERE id_conta NOT IN (
-            SELECT DISTINCT id_pai FROM Plano_Contas WHERE id_pai IS NOT NULL
-        )
-        ORDER BY codigo
-        """
-    ).fetchall()
-
-
-def listar_todas_contas(conn: sqlite3.Connection):
-    """Todas as contas (pais e folhas), usado pra montar a árvore e os
-    seletores de conta-pai no Gerenciador do Plano de Contas."""
-    return conn.execute(
-        """
-        SELECT id_conta, codigo, nome, id_pai, natureza
-        FROM Plano_Contas
-        ORDER BY codigo
-        """
-    ).fetchall()
-
-
-def buscar_conta_por_id(conn: sqlite3.Connection, id_conta: int):
-    return conn.execute(
-        "SELECT id_conta, codigo, nome, id_pai, natureza FROM Plano_Contas WHERE id_conta = ?",
-        (id_conta,),
-    ).fetchone()
-
-
-def _proximo_codigo(conn: sqlite3.Connection, id_pai) -> str:
-    """
-    Calcula o próximo código disponível pra uma nova conta.
-    Conta raiz (sem pai): próximo inteiro livre ('1','2','3'...).
-    Subconta: código do pai + '.' + próximo sufixo livre (ex: '2.5').
-    O código é só rótulo de exibição — quem garante a hierarquia de
-    verdade é sempre id_pai, nunca esse texto.
-    """
-    if id_pai is None:
-        maiores = conn.execute(
-            "SELECT codigo FROM Plano_Contas WHERE id_pai IS NULL"
-        ).fetchall()
-        numeros = [int(r["codigo"]) for r in maiores if r["codigo"].isdigit()]
-        proximo = max(numeros, default=0) + 1
-        return str(proximo)
-
-    pai = conn.execute(
-        "SELECT codigo FROM Plano_Contas WHERE id_conta = ?", (id_pai,)
-    ).fetchone()
-    filhos = conn.execute(
-        "SELECT codigo FROM Plano_Contas WHERE id_pai = ?", (id_pai,)
-    ).fetchall()
-    sufixos = []
-    for f in filhos:
-        partes = f["codigo"].split(".")
-        if partes[-1].isdigit():
-            sufixos.append(int(partes[-1]))
-    proximo_sufixo = max(sufixos, default=0) + 1
-    return f"{pai['codigo']}.{proximo_sufixo}"
-
-
-def inserir_conta(conn: sqlite3.Connection, nome: str, id_pai, natureza: str) -> None:
-    codigo = _proximo_codigo(conn, id_pai)
-    conn.execute(
-        """
-        INSERT INTO Plano_Contas (codigo, nome, id_pai, natureza)
-        VALUES (?, ?, ?, ?)
-        """,
-        (codigo, nome, id_pai, natureza),
+def listar_todas_contas(conn):
+    resp = execute_query(
+        conn.table("plano_contas")
+        .select("id_conta, codigo, nome, id_pai, natureza")
+        .order("codigo"),
+        ttl=0,
     )
-    conn.commit()
+    return resp.data
 
 
-def excluir_conta(conn: sqlite3.Connection, id_conta: int) -> None:
+def listar_plano_contas_folhas(conn):
+    """Contas sem filhos — só elas podem receber lançamento."""
+    todas = listar_todas_contas(conn)
+    ids_com_filhos = {c["id_pai"] for c in todas if c["id_pai"] is not None}
+    folhas = [c for c in todas if c["id_conta"] not in ids_com_filhos]
+    folhas.sort(key=lambda c: c["codigo"])
+    return folhas
+
+
+def buscar_conta_por_id(conn, id_conta: int):
+    resp = execute_query(
+        conn.table("plano_contas").select("*").eq("id_conta", id_conta), ttl=0
+    )
+    return resp.data[0] if resp.data else None
+
+
+def _proximo_codigo(conn, id_pai) -> str:
+    if id_pai is None:
+        resp = execute_query(
+            conn.table("plano_contas").select("codigo").is_("id_pai", "null"), ttl=0
+        )
+        numeros = [int(r["codigo"]) for r in resp.data if r["codigo"].isdigit()]
+        return str(max(numeros, default=0) + 1)
+
+    pai_resp = execute_query(
+        conn.table("plano_contas").select("codigo").eq("id_conta", id_pai), ttl=0
+    )
+    codigo_pai = pai_resp.data[0]["codigo"]
+
+    filhos_resp = execute_query(
+        conn.table("plano_contas").select("codigo").eq("id_pai", id_pai), ttl=0
+    )
+    sufixos = [
+        int(f["codigo"].split(".")[-1])
+        for f in filhos_resp.data
+        if f["codigo"].split(".")[-1].isdigit()
+    ]
+    return f"{codigo_pai}.{max(sufixos, default=0) + 1}"
+
+
+def inserir_conta(conn, nome: str, id_pai, natureza: str) -> None:
+    codigo = _proximo_codigo(conn, id_pai)
+    execute_query(
+        conn.table("plano_contas").insert(
+            {"codigo": codigo, "nome": nome, "id_pai": id_pai, "natureza": natureza}
+        ),
+        ttl=0,
+    )
+
+
+def excluir_conta(conn, id_conta: int) -> None:
+    """Levanta postgrest.APIError (code 23503) se a conta tiver
+    subcontas ou lançamentos/contas a pagar vinculados — sem cascata."""
+    execute_query(conn.table("plano_contas").delete().eq("id_conta", id_conta), ttl=0)
+
+
+def _mapa_raiz(contas: list[dict]) -> dict[int, tuple[str, str]]:
     """
-    Levanta sqlite3.IntegrityError se a conta tiver subcontas ou
-    Lançamentos/Contas_Pagar_Receber vinculados — de propósito, sem
-    cascata: apagar uma categoria não deve apagar histórico financeiro.
+    Pra cada conta, sobe a árvore até achar o ancestral sem pai (raiz) e
+    devolve {id_conta: (codigo_raiz, nome_raiz)}. Substitui a CTE
+    recursiva que existia na versão SQLite — mesmo resultado, calculado
+    em memória porque a API REST não aceita SQL recursivo.
     """
-    conn.execute("DELETE FROM Plano_Contas WHERE id_conta = ?", (id_conta,))
-    conn.commit()
+    por_id = {c["id_conta"]: c for c in contas}
+    mapa: dict[int, tuple[str, str]] = {}
+    for c in contas:
+        atual = c
+        visitados = set()
+        while atual["id_pai"] is not None:
+            if atual["id_conta"] in visitados:
+                break  # proteção contra ciclo acidental no id_pai
+            visitados.add(atual["id_conta"])
+            atual = por_id[atual["id_pai"]]
+        mapa[c["id_conta"]] = (atual["codigo"], atual["nome"])
+    return mapa
 
 
 # ---------------------------------------------------------------------
@@ -308,62 +195,70 @@ def inserir_lancamento(
     id_conta_plano,
     id_transacao_banco=None,
 ) -> None:
-    conn.execute(
-        """
-        INSERT INTO Lancamentos
-            (data, tipo, valor, forma_pagamento, descricao,
-             id_cliente, id_conta_plano, id_transacao_banco)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            data,
-            tipo,
-            valor,
-            forma_pagamento,
-            descricao,
-            id_cliente,
-            id_conta_plano,
-            id_transacao_banco,
+    execute_query(
+        conn.table("lancamentos").insert(
+            {
+                "data": data,
+                "tipo": tipo,
+                "valor": valor,
+                "forma_pagamento": forma_pagamento,
+                "descricao": descricao,
+                "id_cliente": id_cliente,
+                "id_conta_plano": id_conta_plano,
+                "id_transacao_banco": id_transacao_banco,
+            }
         ),
+        ttl=0,
     )
-    conn.commit()
 
 
-def listar_lancamentos(conn: sqlite3.Connection):
-    return conn.execute(
-        """
-        SELECT
-            l.id_lancamento AS id,
-            l.data,
-            l.tipo,
-            l.valor,
-            l.forma_pagamento,
-            l.descricao,
-            c.nome AS cliente,
-            (pc.codigo || ' - ' || pc.nome) AS categoria
-        FROM Lancamentos l
-        LEFT JOIN Clientes c ON l.id_cliente = c.id_cliente
-        JOIN Plano_Contas pc ON l.id_conta_plano = pc.id_conta
-        ORDER BY l.data DESC, l.id_lancamento DESC
-        """
-    ).fetchall()
-
-
-def buscar_lancamento_por_id(conn: sqlite3.Connection, id_lancamento: int):
+def listar_lancamentos(conn):
     """
-    Retorna a linha 'crua' do lançamento (com os IDs de FK, não os nomes
-    já resolvidos) — é isso que o formulário de edição precisa pra
-    pré-selecionar os dropdowns corretamente.
+    Usa o embed automático de FK do PostgREST (clientes(nome),
+    plano_contas(codigo,nome)) em vez de um JOIN manual, e depois achata
+    o resultado pro mesmo formato plano que o app já espera.
     """
-    return conn.execute(
-        """
-        SELECT id_lancamento, data, tipo, valor, forma_pagamento, descricao,
-               id_cliente, id_conta_plano, id_transacao_banco
-        FROM Lancamentos
-        WHERE id_lancamento = ?
-        """,
-        (id_lancamento,),
-    ).fetchone()
+    resp = execute_query(
+        conn.table("lancamentos")
+        .select(
+            "id_lancamento, data, tipo, valor, forma_pagamento, descricao, "
+            "id_cliente, id_conta_plano, clientes(nome), plano_contas(codigo, nome)"
+        )
+        .order("data", desc=True)
+        .order("id_lancamento", desc=True),
+        ttl=0,
+    )
+
+    lancamentos = []
+    for row in resp.data:
+        cliente = row.get("clientes")
+        plano = row.get("plano_contas")
+        lancamentos.append(
+            {
+                "id": row["id_lancamento"],
+                "data": row["data"],
+                "tipo": row["tipo"],
+                "valor": float(row["valor"]),
+                "forma_pagamento": row.get("forma_pagamento"),
+                "descricao": row.get("descricao"),
+                "cliente": cliente["nome"] if cliente else None,
+                "categoria": f"{plano['codigo']} - {plano['nome']}" if plano else "—",
+            }
+        )
+    return lancamentos
+
+
+def buscar_lancamento_por_id(conn, id_lancamento: int):
+    resp = execute_query(
+        conn.table("lancamentos")
+        .select(
+            "id_lancamento, data, tipo, valor, forma_pagamento, descricao, "
+            "id_cliente, id_conta_plano, id_transacao_banco"
+        )
+        .eq("id_lancamento", id_lancamento),
+        ttl=0,
+    )
+    return resp.data[0] if resp.data else None
 
 
 def atualizar_lancamento(
@@ -377,132 +272,87 @@ def atualizar_lancamento(
     id_cliente,
     id_conta_plano,
 ) -> None:
-    conn.execute(
-        """
-        UPDATE Lancamentos
-        SET data = ?,
-            tipo = ?,
-            valor = ?,
-            forma_pagamento = ?,
-            descricao = ?,
-            id_cliente = ?,
-            id_conta_plano = ?
-        WHERE id_lancamento = ?
-        """,
-        (
-            data,
-            tipo,
-            valor,
-            forma_pagamento,
-            descricao,
-            id_cliente,
-            id_conta_plano,
-            id_lancamento,
-        ),
-    )
-    conn.commit()
-
-
-def excluir_lancamento(conn: sqlite3.Connection, id_lancamento: int) -> None:
-    conn.execute(
-        "DELETE FROM Lancamentos WHERE id_lancamento = ?", (id_lancamento,)
-    )
-    conn.commit()
-
-
-# ---------------------------------------------------------------------
-# DRE (Demonstração do Resultado do Exercício)
-# ---------------------------------------------------------------------
-
-def buscar_totais_dre(conn: sqlite3.Connection):
-    """
-    Agrega todos os Lançamentos por Ano/Mês e pela categoria RAIZ do
-    Plano de Contas (ex: '1. Receitas', '2. Despesas Fixas', etc.),
-    não pela categoria-folha em que o lançamento foi de fato registrado.
-
-    Usa uma CTE recursiva pra subir a árvore do Plano de Contas até
-    encontrar o ancestral sem pai (id_pai IS NULL) — isso funciona
-    independente de quantos níveis de profundidade existirem.
-
-    Retorna linhas: ano_mes, raiz_codigo, raiz_nome, total
-    """
-    return conn.execute(
-        """
-        WITH RECURSIVE raiz AS (
-            SELECT id_conta AS id_conta_original, id_conta, codigo, nome, id_pai
-            FROM Plano_Contas
-            UNION ALL
-            SELECT r.id_conta_original, pc.id_conta, pc.codigo, pc.nome, pc.id_pai
-            FROM raiz r
-            JOIN Plano_Contas pc ON pc.id_conta = r.id_pai
-        ),
-        raiz_final AS (
-            SELECT id_conta_original, codigo, nome
-            FROM raiz
-            WHERE id_pai IS NULL
+    execute_query(
+        conn.table("lancamentos")
+        .update(
+            {
+                "data": data,
+                "tipo": tipo,
+                "valor": valor,
+                "forma_pagamento": forma_pagamento,
+                "descricao": descricao,
+                "id_cliente": id_cliente,
+                "id_conta_plano": id_conta_plano,
+            }
         )
-        SELECT
-            strftime('%Y-%m', l.data) AS ano_mes,
-            rf.codigo AS raiz_codigo,
-            rf.nome AS raiz_nome,
-            SUM(l.valor) AS total
-        FROM Lancamentos l
-        JOIN raiz_final rf ON rf.id_conta_original = l.id_conta_plano
-        GROUP BY ano_mes, rf.codigo, rf.nome
-        ORDER BY ano_mes, rf.codigo
-        """
-    ).fetchall()
+        .eq("id_lancamento", id_lancamento),
+        ttl=0,
+    )
 
 
-def listar_meses_disponiveis(conn: sqlite3.Connection):
-    """Lista os meses (formato 'YYYY-MM') que têm ao menos um lançamento."""
-    return [
-        row["ano_mes"]
-        for row in conn.execute(
-            """
-            SELECT DISTINCT strftime('%Y-%m', data) AS ano_mes
-            FROM Lancamentos
-            ORDER BY ano_mes
-            """
-        ).fetchall()
+def excluir_lancamento(conn, id_lancamento: int) -> None:
+    execute_query(
+        conn.table("lancamentos").delete().eq("id_lancamento", id_lancamento), ttl=0
+    )
+
+
+# ---------------------------------------------------------------------
+# DRE / Dashboard — agregação em Python (ver _mapa_raiz acima)
+# ---------------------------------------------------------------------
+
+def _lancamentos_brutos(conn, ano_mes: str | None = None):
+    query = conn.table("lancamentos").select("data, valor, id_conta_plano")
+    if ano_mes:
+        ano, mes = map(int, ano_mes.split("-"))
+        proximo = f"{ano + 1}-01-01" if mes == 12 else f"{ano}-{mes + 1:02d}-01"
+        query = query.gte("data", f"{ano_mes}-01").lt("data", proximo)
+    resp = execute_query(query, ttl=0)
+    return resp.data
+
+
+def buscar_totais_dre(conn):
+    contas = listar_todas_contas(conn)
+    raiz_de = _mapa_raiz(contas)
+    lancamentos = _lancamentos_brutos(conn)
+
+    somas: dict[tuple[str, str, str], float] = {}
+    for l in lancamentos:
+        ano_mes = l["data"][:7]
+        raiz_codigo, raiz_nome = raiz_de.get(l["id_conta_plano"], ("?", "Sem categoria"))
+        chave = (ano_mes, raiz_codigo, raiz_nome)
+        somas[chave] = somas.get(chave, 0.0) + float(l["valor"])
+
+    linhas = [
+        {"ano_mes": am, "raiz_codigo": rc, "raiz_nome": rn, "total": total}
+        for (am, rc, rn), total in somas.items()
     ]
+    linhas.sort(key=lambda r: (r["ano_mes"], r["raiz_codigo"]))
+    return linhas
 
 
-def buscar_despesas_por_categoria(conn: sqlite3.Connection, ano_mes: str):
-    """
-    Detalha as despesas do mês informado pela categoria-folha real onde
-    cada lançamento foi registrado (não pela raiz) — granularidade
-    necessária pro gráfico de pizza mostrar onde o dinheiro está indo
-    (ex: 'Aluguel' e 'Marketing' separados, não só 'Despesas').
+def listar_meses_disponiveis(conn):
+    lancamentos = _lancamentos_brutos(conn)
+    return sorted({l["data"][:7] for l in lancamentos})
 
-    Inclui Impostos como despesa aqui (raiz != Receitas), decisão
-    explicada no chat.
-    """
-    return conn.execute(
-        """
-        WITH RECURSIVE raiz AS (
-            SELECT id_conta AS id_conta_original, id_conta, codigo, nome, id_pai
-            FROM Plano_Contas
-            UNION ALL
-            SELECT r.id_conta_original, pc.id_conta, pc.codigo, pc.nome, pc.id_pai
-            FROM raiz r
-            JOIN Plano_Contas pc ON pc.id_conta = r.id_pai
-        ),
-        raiz_final AS (
-            SELECT id_conta_original, codigo
-            FROM raiz
-            WHERE id_pai IS NULL
-        )
-        SELECT
-            (pc.codigo || ' - ' || pc.nome) AS categoria,
-            SUM(l.valor) AS total
-        FROM Lancamentos l
-        JOIN Plano_Contas pc ON pc.id_conta = l.id_conta_plano
-        JOIN raiz_final rf ON rf.id_conta_original = l.id_conta_plano
-        WHERE strftime('%Y-%m', l.data) = ?
-          AND rf.codigo != '1'
-        GROUP BY pc.id_conta
-        ORDER BY total DESC
-        """,
-        (ano_mes,),
-    ).fetchall()
+
+def buscar_despesas_por_categoria(conn, ano_mes: str):
+    contas = listar_todas_contas(conn)
+    contas_por_id = {c["id_conta"]: c for c in contas}
+    raiz_de = _mapa_raiz(contas)
+
+    lancamentos = _lancamentos_brutos(conn, ano_mes=ano_mes)
+
+    somas: dict[int, float] = {}
+    for l in lancamentos:
+        raiz_codigo, _ = raiz_de.get(l["id_conta_plano"], ("1", ""))
+        if raiz_codigo == "1":
+            continue  # exclui Receitas — só queremos despesas aqui
+        somas[l["id_conta_plano"]] = somas.get(l["id_conta_plano"], 0.0) + float(l["valor"])
+
+    linhas = []
+    for id_conta, total in somas.items():
+        conta = contas_por_id.get(id_conta)
+        rotulo = f"{conta['codigo']} - {conta['nome']}" if conta else "Categoria removida"
+        linhas.append({"categoria": rotulo, "total": total})
+    linhas.sort(key=lambda r: r["total"], reverse=True)
+    return linhas

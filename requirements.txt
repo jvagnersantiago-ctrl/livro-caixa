@@ -1,3 +1,5 @@
 streamlit
 pandas
 plotly
+st-supabase-connection
+postgrest

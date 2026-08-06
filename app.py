@@ -1,16 +1,17 @@
 """
 Interface Streamlit para o Livro Caixa.
 Rodar com: streamlit run app.py
-Requer que livro_caixa.db já exista (rode criar_banco.py primeiro).
+Requer que o schema já esteja criado no Supabase (schema_postgres.sql,
+rodado uma vez no SQL Editor) e as credenciais em .streamlit/secrets.toml.
 """
 
 import hashlib
-import sqlite3
 from datetime import date
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from postgrest import APIError
 
 import db
 
@@ -30,9 +31,9 @@ def _hash_senha(senha: str) -> str:
 
 
 USUARIOS = {
-    "admin": _hash_senha("Cobra611*"),
+    "admin": _hash_senha("admin123"),
     # TROCAR ANTES DE USAR: nome de usuário e senha reais da sua esposa.
-    "usuario_2": _hash_senha("kj071784"),
+    "usuario_2": _hash_senha("troque-esta-senha"),
 }
 
 
@@ -65,8 +66,11 @@ if not st.session_state["autenticado"]:
 
 # ---- A partir daqui, o usuário já está autenticado ----
 
+# Não existe mais um "inicializar_banco()" automático: a API REST do
+# Supabase não roda CREATE TABLE. O schema já foi criado uma vez direto
+# no SQL Editor (schema_postgres.sql) — se as tabelas não existirem lá,
+# é isso que precisa ser rodado, não algo que o app possa resolver sozinho.
 conn = db.get_connection()
-db.inicializar_banco(conn)
 
 FORMAS_PAGAMENTO = [
     "Pix", "Dinheiro", "Cartão de Crédito", "Cartão de Débito",
@@ -124,7 +128,7 @@ if pagina == "Clientes":
                         )
                         st.success(f"Cliente '{nome}' cadastrado.")
                         st.rerun()
-                    except sqlite3.IntegrityError:
+                    except APIError:
                         st.error("Já existe um cliente cadastrado com esse CPF.")
 
     st.subheader("Clientes cadastrados")
@@ -189,7 +193,7 @@ if pagina == "Clientes":
                             st.session_state["cliente_editando"] = None
                             st.success("Cliente atualizado.")
                             st.rerun()
-                        except sqlite3.IntegrityError:
+                        except APIError:
                             st.error("Já existe outro cliente cadastrado com esse CPF.")
                 if cancelar:
                     st.session_state["cliente_editando"] = None
@@ -207,7 +211,7 @@ if pagina == "Clientes":
                     st.session_state["cliente_excluindo"] = None
                     st.success("Cliente excluído.")
                     st.rerun()
-                except sqlite3.IntegrityError:
+                except APIError:
                     st.error(
                         "Não é possível excluir: este cliente tem lançamentos "
                         "ou contas a pagar/receber vinculados a ele."
@@ -487,7 +491,7 @@ elif pagina == "Plano de Contas":
                     db.excluir_conta(conn, id_conta_excluir)
                     st.success("Conta excluída.")
                     st.rerun()
-                except sqlite3.IntegrityError:
+                except APIError:
                     st.error(
                         "Não é possível excluir: esta conta tem subcontas ou "
                         "lançamentos/contas a pagar vinculados a ela."
