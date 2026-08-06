@@ -31,9 +31,9 @@ def _hash_senha(senha: str) -> str:
 
 
 USUARIOS = {
-    "admin": _hash_senha("admin123"),
+    "admin": _hash_senha("Cobra611"),
     # TROCAR ANTES DE USAR: nome de usuário e senha reais da sua esposa.
-    "usuario_2": _hash_senha("troque-esta-senha"),
+    "usuario_2": _hash_senha("kj071784"),
 }
 
 
