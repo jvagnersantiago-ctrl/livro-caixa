@@ -31,13 +31,25 @@ import streamlit as st
 
 @st.cache_resource
 def _conectar():
-    return psycopg2.connect(
-        host=st.secrets["connections"]["postgresql"]["host"],
-        database=st.secrets["connections"]["postgresql"]["database"],
-        user=st.secrets["connections"]["postgresql"]["user"],
-        password=st.secrets["connections"]["postgresql"]["password"],
-        port=st.secrets["connections"]["postgresql"]["port"],
-    )
+    # =====================================================================
+    # DIAGNÓSTICO TEMPORÁRIO — REMOVER DEPOIS DE RESOLVER O ERRO DE CONEXÃO.
+    # Mostra a mensagem real do psycopg2/Postgres na tela (o Streamlit Cloud
+    # esconde detalhes de exceção não tratada por padrão). Depois que a
+    # conexão estiver funcionando, tire este try/except e volte a deixar
+    # a função levantar a exceção normalmente — ver versão original abaixo.
+    # =====================================================================
+    try:
+        return psycopg2.connect(
+            host=st.secrets["connections"]["postgresql"]["host"],
+            database=st.secrets["connections"]["postgresql"]["database"],
+            user=st.secrets["connections"]["postgresql"]["user"],
+            password=st.secrets["connections"]["postgresql"]["password"],
+            port=st.secrets["connections"]["postgresql"]["port"],
+        )
+    except Exception as e:
+        st.error(f"Falha ao conectar no banco:\n\n{e}")
+        st.stop()
+    # ===================== FIM DO DIAGNÓSTICO TEMPORÁRIO =====================
 
 
 def get_connection():
