@@ -11,7 +11,7 @@ from datetime import date
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from postgrest import APIError
+from sqlalchemy.exc import IntegrityError
 
 import db
 
@@ -31,9 +31,9 @@ def _hash_senha(senha: str) -> str:
 
 
 USUARIOS = {
-    "admin": _hash_senha("Cobra611"),
+    "admin": _hash_senha("admin123"),
     # TROCAR ANTES DE USAR: nome de usuário e senha reais da sua esposa.
-    "usuario_2": _hash_senha("kj071784"),
+    "usuario_2": _hash_senha("troque-esta-senha"),
 }
 
 
@@ -128,7 +128,7 @@ if pagina == "Clientes":
                         )
                         st.success(f"Cliente '{nome}' cadastrado.")
                         st.rerun()
-                    except APIError:
+                    except IntegrityError:
                         st.error("Já existe um cliente cadastrado com esse CPF.")
 
     st.subheader("Clientes cadastrados")
@@ -193,7 +193,7 @@ if pagina == "Clientes":
                             st.session_state["cliente_editando"] = None
                             st.success("Cliente atualizado.")
                             st.rerun()
-                        except APIError:
+                        except IntegrityError:
                             st.error("Já existe outro cliente cadastrado com esse CPF.")
                 if cancelar:
                     st.session_state["cliente_editando"] = None
@@ -211,7 +211,7 @@ if pagina == "Clientes":
                     st.session_state["cliente_excluindo"] = None
                     st.success("Cliente excluído.")
                     st.rerun()
-                except APIError:
+                except IntegrityError:
                     st.error(
                         "Não é possível excluir: este cliente tem lançamentos "
                         "ou contas a pagar/receber vinculados a ele."
@@ -491,7 +491,7 @@ elif pagina == "Plano de Contas":
                     db.excluir_conta(conn, id_conta_excluir)
                     st.success("Conta excluída.")
                     st.rerun()
-                except APIError:
+                except IntegrityError:
                     st.error(
                         "Não é possível excluir: esta conta tem subcontas ou "
                         "lançamentos/contas a pagar vinculados a ela."

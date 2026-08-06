@@ -1,32 +1,63 @@
 """
-Camada de acesso a dados do Livro Caixa, agora falando com o Supabase
-(PostgreSQL) via API REST (postgrest), através da lib st-supabase-connection.
+Camada de acesso a dados do Livro Caixa, conectando direto no PostgreSQL
+do Supabase via SQLAlchemy (conector nativo st.connection(..., type="sql")).
 
-Diferença importante em relação à versão SQLite: não existe SQL arbitrário
-aqui (a API REST não aceita isso). Consultas que antes eram uma CTE
-recursiva ou usavam strftime() agora buscam os dados brutos e fazem a
-agregação em Python — o Plano de Contas inteiro cabe tranquilamente em
-memória (poucas dezenas de linhas), então isso não é gargalo de
-performance, é só uma forma diferente de resolver o mesmo problema.
+Usa a string de conexão do CONNECTION POOLER (Session mode) do Supabase,
+não a "Direct Connection" — a conexão direta hoje é IPv6-only, e
+plataformas como o Streamlit Community Cloud costumam ter saída IPv6
+instável, o que causa exatamente falhas de conexão intermitentes.
 
-Todas as leituras usam ttl=0 (cache desligado) de propósito: um
-lançamento que acabou de ser gravado precisa aparecer imediatamente no
-histórico, na DRE e no Dashboard — cache de resultado atrapalharia isso.
+Todo write (INSERT/UPDATE/DELETE) faz rollback explícito em caso de erro
+de integridade antes de relançar a exceção — sem isso, a sessão do
+SQLAlchemy (que o Streamlit reaproveita entre reruns) fica numa
+transação "abortada" e toda operação seguinte falha até reiniciar o app,
+mesmo sem relação nenhuma com o erro original.
 """
 
 from __future__ import annotations
 
 import streamlit as st
-from postgrest import APIError  # noqa: F401 (reexportado pra uso no app.py)
-from st_supabase_connection import SupabaseConnection, execute_query
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError  # noqa: F401 (reexportado pro app.py)
 
 
 def get_connection():
+    return st.connection("postgresql", type="sql")
+
+
+def _executar_escrita(conn, sql: str, params: dict) -> None:
     """
-    st.connection já cacheia o client em si (não a query) — chamar isso
-    de novo em todo rerun do Streamlit é barato e seguro.
+    Executa um INSERT/UPDATE/DELETE. Em caso de erro de integridade
+    (unique, FK, check), faz rollback explícito antes de relançar —
+    essencial porque a sessão é reaproveitada entre reruns do Streamlit.
     """
-    return st.connection("supabase_connection", type=SupabaseConnection, ttl=None)
+    with conn.session as session:
+        try:
+            session.execute(text(sql), params)
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            raise
+
+
+def _para_registros(df, colunas_numericas: tuple[str, ...] = (), colunas_data: tuple[str, ...] = ()) -> list[dict]:
+    """
+    Converte o DataFrame que conn.query() devolve numa lista de dicts
+    simples, normalizando dois pontos que mudam de comportamento em
+    relação à versão anterior (REST/JSON):
+      * valores NUMERIC podem voltar como Decimal — forço float, senão
+        'Decimal + float' explode em runtime na hora de somar totais.
+      * colunas DATE podem voltar como Timestamp do pandas — forço
+        string 'YYYY-MM-DD', que é o formato que o app.py espera
+        (ex: date.fromisoformat() no formulário de edição).
+    """
+    for col in colunas_numericas:
+        if col in df.columns:
+            df[col] = df[col].astype(float)
+    for col in colunas_data:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.slice(0, 10)
+    return df.to_dict("records")
 
 
 # ---------------------------------------------------------------------
@@ -34,59 +65,54 @@ def get_connection():
 # ---------------------------------------------------------------------
 
 def listar_clientes(conn):
-    resp = execute_query(
-        conn.table("clientes")
-        .select("id_cliente, nome, cpf, telefone, email, observacoes")
-        .order("nome"),
+    df = conn.query(
+        "SELECT id_cliente, nome, cpf, telefone, email, observacoes "
+        "FROM clientes ORDER BY nome",
         ttl=0,
     )
-    return resp.data
+    return _para_registros(df)
 
 
 def inserir_cliente(conn, nome, cpf, telefone, email, observacoes) -> None:
-    execute_query(
-        conn.table("clientes").insert(
-            {
-                "nome": nome,
-                "cpf": cpf,
-                "telefone": telefone,
-                "email": email,
-                "observacoes": observacoes,
-            }
-        ),
-        ttl=0,
+    _executar_escrita(
+        conn,
+        """
+        INSERT INTO clientes (nome, cpf, telefone, email, observacoes)
+        VALUES (:nome, :cpf, :telefone, :email, :observacoes)
+        """,
+        {"nome": nome, "cpf": cpf, "telefone": telefone, "email": email, "observacoes": observacoes},
     )
 
 
 def buscar_cliente_por_id(conn, id_cliente: int):
-    resp = execute_query(
-        conn.table("clientes").select("*").eq("id_cliente", id_cliente), ttl=0
+    df = conn.query(
+        "SELECT id_cliente, nome, cpf, telefone, email, observacoes "
+        "FROM clientes WHERE id_cliente = :id",
+        params={"id": id_cliente},
+        ttl=0,
     )
-    return resp.data[0] if resp.data else None
+    registros = _para_registros(df)
+    return registros[0] if registros else None
 
 
 def atualizar_cliente(conn, id_cliente, nome, cpf, telefone, email, observacoes) -> None:
-    execute_query(
-        conn.table("clientes")
-        .update(
-            {
-                "nome": nome,
-                "cpf": cpf,
-                "telefone": telefone,
-                "email": email,
-                "observacoes": observacoes,
-            }
-        )
-        .eq("id_cliente", id_cliente),
-        ttl=0,
+    _executar_escrita(
+        conn,
+        """
+        UPDATE clientes
+        SET nome = :nome, cpf = :cpf, telefone = :telefone,
+            email = :email, observacoes = :observacoes
+        WHERE id_cliente = :id
+        """,
+        {"id": id_cliente, "nome": nome, "cpf": cpf, "telefone": telefone,
+         "email": email, "observacoes": observacoes},
     )
 
 
 def excluir_cliente(conn, id_cliente: int) -> None:
-    """Levanta postgrest.APIError (code 23503) se houver Lançamentos ou
-    Contas_Pagar_Receber vinculados a este cliente — sem SET NULL nem
-    cascata, de propósito."""
-    execute_query(conn.table("clientes").delete().eq("id_cliente", id_cliente), ttl=0)
+    """Levanta sqlalchemy.exc.IntegrityError se houver Lançamentos ou
+    Contas_Pagar_Receber vinculados a este cliente."""
+    _executar_escrita(conn, "DELETE FROM clientes WHERE id_cliente = :id", {"id": id_cliente})
 
 
 # ---------------------------------------------------------------------
@@ -94,90 +120,78 @@ def excluir_cliente(conn, id_cliente: int) -> None:
 # ---------------------------------------------------------------------
 
 def listar_todas_contas(conn):
-    resp = execute_query(
-        conn.table("plano_contas")
-        .select("id_conta, codigo, nome, id_pai, natureza")
-        .order("codigo"),
+    df = conn.query(
+        "SELECT id_conta, codigo, nome, id_pai, natureza FROM plano_contas ORDER BY codigo",
         ttl=0,
     )
-    return resp.data
+    return _para_registros(df)
 
 
 def listar_plano_contas_folhas(conn):
     """Contas sem filhos — só elas podem receber lançamento."""
-    todas = listar_todas_contas(conn)
-    ids_com_filhos = {c["id_pai"] for c in todas if c["id_pai"] is not None}
-    folhas = [c for c in todas if c["id_conta"] not in ids_com_filhos]
-    folhas.sort(key=lambda c: c["codigo"])
-    return folhas
+    df = conn.query(
+        """
+        SELECT id_conta, codigo, nome
+        FROM plano_contas
+        WHERE id_conta NOT IN (
+            SELECT DISTINCT id_pai FROM plano_contas WHERE id_pai IS NOT NULL
+        )
+        ORDER BY codigo
+        """,
+        ttl=0,
+    )
+    return _para_registros(df)
 
 
 def buscar_conta_por_id(conn, id_conta: int):
-    resp = execute_query(
-        conn.table("plano_contas").select("*").eq("id_conta", id_conta), ttl=0
+    df = conn.query(
+        "SELECT id_conta, codigo, nome, id_pai, natureza FROM plano_contas WHERE id_conta = :id",
+        params={"id": id_conta},
+        ttl=0,
     )
-    return resp.data[0] if resp.data else None
+    registros = _para_registros(df)
+    return registros[0] if registros else None
 
 
 def _proximo_codigo(conn, id_pai) -> str:
     if id_pai is None:
-        resp = execute_query(
-            conn.table("plano_contas").select("codigo").is_("id_pai", "null"), ttl=0
+        df = conn.query(
+            "SELECT codigo FROM plano_contas WHERE id_pai IS NULL", ttl=0
         )
-        numeros = [int(r["codigo"]) for r in resp.data if r["codigo"].isdigit()]
+        numeros = [int(c) for c in df["codigo"] if str(c).isdigit()]
         return str(max(numeros, default=0) + 1)
 
-    pai_resp = execute_query(
-        conn.table("plano_contas").select("codigo").eq("id_conta", id_pai), ttl=0
+    df_pai = conn.query(
+        "SELECT codigo FROM plano_contas WHERE id_conta = :id",
+        params={"id": id_pai},
+        ttl=0,
     )
-    codigo_pai = pai_resp.data[0]["codigo"]
+    codigo_pai = df_pai["codigo"].iloc[0]
 
-    filhos_resp = execute_query(
-        conn.table("plano_contas").select("codigo").eq("id_pai", id_pai), ttl=0
+    df_filhos = conn.query(
+        "SELECT codigo FROM plano_contas WHERE id_pai = :id_pai",
+        params={"id_pai": id_pai},
+        ttl=0,
     )
     sufixos = [
-        int(f["codigo"].split(".")[-1])
-        for f in filhos_resp.data
-        if f["codigo"].split(".")[-1].isdigit()
+        int(c.split(".")[-1]) for c in df_filhos["codigo"] if c.split(".")[-1].isdigit()
     ]
     return f"{codigo_pai}.{max(sufixos, default=0) + 1}"
 
 
 def inserir_conta(conn, nome: str, id_pai, natureza: str) -> None:
     codigo = _proximo_codigo(conn, id_pai)
-    execute_query(
-        conn.table("plano_contas").insert(
-            {"codigo": codigo, "nome": nome, "id_pai": id_pai, "natureza": natureza}
-        ),
-        ttl=0,
+    _executar_escrita(
+        conn,
+        "INSERT INTO plano_contas (codigo, nome, id_pai, natureza) VALUES (:codigo, :nome, :id_pai, :natureza)",
+        {"codigo": codigo, "nome": nome, "id_pai": id_pai, "natureza": natureza},
     )
 
 
 def excluir_conta(conn, id_conta: int) -> None:
-    """Levanta postgrest.APIError (code 23503) se a conta tiver
-    subcontas ou lançamentos/contas a pagar vinculados — sem cascata."""
-    execute_query(conn.table("plano_contas").delete().eq("id_conta", id_conta), ttl=0)
-
-
-def _mapa_raiz(contas: list[dict]) -> dict[int, tuple[str, str]]:
-    """
-    Pra cada conta, sobe a árvore até achar o ancestral sem pai (raiz) e
-    devolve {id_conta: (codigo_raiz, nome_raiz)}. Substitui a CTE
-    recursiva que existia na versão SQLite — mesmo resultado, calculado
-    em memória porque a API REST não aceita SQL recursivo.
-    """
-    por_id = {c["id_conta"]: c for c in contas}
-    mapa: dict[int, tuple[str, str]] = {}
-    for c in contas:
-        atual = c
-        visitados = set()
-        while atual["id_pai"] is not None:
-            if atual["id_conta"] in visitados:
-                break  # proteção contra ciclo acidental no id_pai
-            visitados.add(atual["id_conta"])
-            atual = por_id[atual["id_pai"]]
-        mapa[c["id_conta"]] = (atual["codigo"], atual["nome"])
-    return mapa
+    """Levanta sqlalchemy.exc.IntegrityError se a conta tiver subcontas
+    ou lançamentos/contas a pagar vinculados — sem cascata."""
+    _executar_escrita(conn, "DELETE FROM plano_contas WHERE id_conta = :id", {"id": id_conta})
 
 
 # ---------------------------------------------------------------------
@@ -185,174 +199,149 @@ def _mapa_raiz(contas: list[dict]) -> dict[int, tuple[str, str]]:
 # ---------------------------------------------------------------------
 
 def inserir_lancamento(
-    conn,
-    data,
-    tipo,
-    valor,
-    forma_pagamento,
-    descricao,
-    id_cliente,
-    id_conta_plano,
+    conn, data, tipo, valor, forma_pagamento, descricao, id_cliente, id_conta_plano,
     id_transacao_banco=None,
 ) -> None:
-    execute_query(
-        conn.table("lancamentos").insert(
-            {
-                "data": data,
-                "tipo": tipo,
-                "valor": valor,
-                "forma_pagamento": forma_pagamento,
-                "descricao": descricao,
-                "id_cliente": id_cliente,
-                "id_conta_plano": id_conta_plano,
-                "id_transacao_banco": id_transacao_banco,
-            }
-        ),
-        ttl=0,
+    _executar_escrita(
+        conn,
+        """
+        INSERT INTO lancamentos
+            (data, tipo, valor, forma_pagamento, descricao,
+             id_cliente, id_conta_plano, id_transacao_banco)
+        VALUES
+            (:data, :tipo, :valor, :forma_pagamento, :descricao,
+             :id_cliente, :id_conta_plano, :id_transacao_banco)
+        """,
+        {"data": data, "tipo": tipo, "valor": valor, "forma_pagamento": forma_pagamento,
+         "descricao": descricao, "id_cliente": id_cliente, "id_conta_plano": id_conta_plano,
+         "id_transacao_banco": id_transacao_banco},
     )
 
 
 def listar_lancamentos(conn):
-    """
-    Usa o embed automático de FK do PostgREST (clientes(nome),
-    plano_contas(codigo,nome)) em vez de um JOIN manual, e depois achata
-    o resultado pro mesmo formato plano que o app já espera.
-    """
-    resp = execute_query(
-        conn.table("lancamentos")
-        .select(
-            "id_lancamento, data, tipo, valor, forma_pagamento, descricao, "
-            "id_cliente, id_conta_plano, clientes(nome), plano_contas(codigo, nome)"
-        )
-        .order("data", desc=True)
-        .order("id_lancamento", desc=True),
+    df = conn.query(
+        """
+        SELECT
+            l.id_lancamento AS id,
+            l.data,
+            l.tipo,
+            l.valor,
+            l.forma_pagamento,
+            l.descricao,
+            c.nome AS cliente,
+            (pc.codigo || ' - ' || pc.nome) AS categoria
+        FROM lancamentos l
+        LEFT JOIN clientes c ON l.id_cliente = c.id_cliente
+        JOIN plano_contas pc ON l.id_conta_plano = pc.id_conta
+        ORDER BY l.data DESC, l.id_lancamento DESC
+        """,
         ttl=0,
     )
-
-    lancamentos = []
-    for row in resp.data:
-        cliente = row.get("clientes")
-        plano = row.get("plano_contas")
-        lancamentos.append(
-            {
-                "id": row["id_lancamento"],
-                "data": row["data"],
-                "tipo": row["tipo"],
-                "valor": float(row["valor"]),
-                "forma_pagamento": row.get("forma_pagamento"),
-                "descricao": row.get("descricao"),
-                "cliente": cliente["nome"] if cliente else None,
-                "categoria": f"{plano['codigo']} - {plano['nome']}" if plano else "—",
-            }
-        )
-    return lancamentos
+    return _para_registros(df, colunas_numericas=("valor",), colunas_data=("data",))
 
 
 def buscar_lancamento_por_id(conn, id_lancamento: int):
-    resp = execute_query(
-        conn.table("lancamentos")
-        .select(
-            "id_lancamento, data, tipo, valor, forma_pagamento, descricao, "
-            "id_cliente, id_conta_plano, id_transacao_banco"
-        )
-        .eq("id_lancamento", id_lancamento),
+    df = conn.query(
+        """
+        SELECT id_lancamento, data, tipo, valor, forma_pagamento, descricao,
+               id_cliente, id_conta_plano, id_transacao_banco
+        FROM lancamentos WHERE id_lancamento = :id
+        """,
+        params={"id": id_lancamento},
         ttl=0,
     )
-    return resp.data[0] if resp.data else None
+    registros = _para_registros(df, colunas_numericas=("valor",), colunas_data=("data",))
+    return registros[0] if registros else None
 
 
 def atualizar_lancamento(
-    conn,
-    id_lancamento,
-    data,
-    tipo,
-    valor,
-    forma_pagamento,
-    descricao,
-    id_cliente,
-    id_conta_plano,
+    conn, id_lancamento, data, tipo, valor, forma_pagamento, descricao, id_cliente, id_conta_plano,
 ) -> None:
-    execute_query(
-        conn.table("lancamentos")
-        .update(
-            {
-                "data": data,
-                "tipo": tipo,
-                "valor": valor,
-                "forma_pagamento": forma_pagamento,
-                "descricao": descricao,
-                "id_cliente": id_cliente,
-                "id_conta_plano": id_conta_plano,
-            }
-        )
-        .eq("id_lancamento", id_lancamento),
-        ttl=0,
+    _executar_escrita(
+        conn,
+        """
+        UPDATE lancamentos
+        SET data = :data, tipo = :tipo, valor = :valor, forma_pagamento = :forma_pagamento,
+            descricao = :descricao, id_cliente = :id_cliente, id_conta_plano = :id_conta_plano
+        WHERE id_lancamento = :id
+        """,
+        {"id": id_lancamento, "data": data, "tipo": tipo, "valor": valor,
+         "forma_pagamento": forma_pagamento, "descricao": descricao,
+         "id_cliente": id_cliente, "id_conta_plano": id_conta_plano},
     )
 
 
 def excluir_lancamento(conn, id_lancamento: int) -> None:
-    execute_query(
-        conn.table("lancamentos").delete().eq("id_lancamento", id_lancamento), ttl=0
+    _executar_escrita(conn, "DELETE FROM lancamentos WHERE id_lancamento = :id", {"id": id_lancamento})
+
+
+# ---------------------------------------------------------------------
+# DRE / Dashboard
+# Com conexão SQL de verdade, voltamos a usar CTE recursiva no banco
+# (mais simples e mais rápido que refazer a árvore em Python, que foi
+# o contorno necessário na versão anterior via API REST).
+# ---------------------------------------------------------------------
+
+_CTE_RAIZ = """
+    WITH RECURSIVE raiz AS (
+        SELECT id_conta AS id_conta_original, id_conta, codigo, nome, id_pai
+        FROM plano_contas
+        UNION ALL
+        SELECT r.id_conta_original, pc.id_conta, pc.codigo, pc.nome, pc.id_pai
+        FROM raiz r
+        JOIN plano_contas pc ON pc.id_conta = r.id_pai
+    ),
+    raiz_final AS (
+        SELECT id_conta_original, codigo, nome
+        FROM raiz
+        WHERE id_pai IS NULL
     )
-
-
-# ---------------------------------------------------------------------
-# DRE / Dashboard — agregação em Python (ver _mapa_raiz acima)
-# ---------------------------------------------------------------------
-
-def _lancamentos_brutos(conn, ano_mes: str | None = None):
-    query = conn.table("lancamentos").select("data, valor, id_conta_plano")
-    if ano_mes:
-        ano, mes = map(int, ano_mes.split("-"))
-        proximo = f"{ano + 1}-01-01" if mes == 12 else f"{ano}-{mes + 1:02d}-01"
-        query = query.gte("data", f"{ano_mes}-01").lt("data", proximo)
-    resp = execute_query(query, ttl=0)
-    return resp.data
+"""
 
 
 def buscar_totais_dre(conn):
-    contas = listar_todas_contas(conn)
-    raiz_de = _mapa_raiz(contas)
-    lancamentos = _lancamentos_brutos(conn)
-
-    somas: dict[tuple[str, str, str], float] = {}
-    for l in lancamentos:
-        ano_mes = l["data"][:7]
-        raiz_codigo, raiz_nome = raiz_de.get(l["id_conta_plano"], ("?", "Sem categoria"))
-        chave = (ano_mes, raiz_codigo, raiz_nome)
-        somas[chave] = somas.get(chave, 0.0) + float(l["valor"])
-
-    linhas = [
-        {"ano_mes": am, "raiz_codigo": rc, "raiz_nome": rn, "total": total}
-        for (am, rc, rn), total in somas.items()
-    ]
-    linhas.sort(key=lambda r: (r["ano_mes"], r["raiz_codigo"]))
-    return linhas
+    df = conn.query(
+        _CTE_RAIZ
+        + """
+        SELECT
+            to_char(l.data, 'YYYY-MM') AS ano_mes,
+            rf.codigo AS raiz_codigo,
+            rf.nome AS raiz_nome,
+            SUM(l.valor) AS total
+        FROM lancamentos l
+        JOIN raiz_final rf ON rf.id_conta_original = l.id_conta_plano
+        GROUP BY ano_mes, rf.codigo, rf.nome
+        ORDER BY ano_mes, rf.codigo
+        """,
+        ttl=0,
+    )
+    return _para_registros(df, colunas_numericas=("total",))
 
 
 def listar_meses_disponiveis(conn):
-    lancamentos = _lancamentos_brutos(conn)
-    return sorted({l["data"][:7] for l in lancamentos})
+    df = conn.query(
+        "SELECT DISTINCT to_char(data, 'YYYY-MM') AS ano_mes FROM lancamentos ORDER BY ano_mes",
+        ttl=0,
+    )
+    return df["ano_mes"].tolist()
 
 
 def buscar_despesas_por_categoria(conn, ano_mes: str):
-    contas = listar_todas_contas(conn)
-    contas_por_id = {c["id_conta"]: c for c in contas}
-    raiz_de = _mapa_raiz(contas)
-
-    lancamentos = _lancamentos_brutos(conn, ano_mes=ano_mes)
-
-    somas: dict[int, float] = {}
-    for l in lancamentos:
-        raiz_codigo, _ = raiz_de.get(l["id_conta_plano"], ("1", ""))
-        if raiz_codigo == "1":
-            continue  # exclui Receitas — só queremos despesas aqui
-        somas[l["id_conta_plano"]] = somas.get(l["id_conta_plano"], 0.0) + float(l["valor"])
-
-    linhas = []
-    for id_conta, total in somas.items():
-        conta = contas_por_id.get(id_conta)
-        rotulo = f"{conta['codigo']} - {conta['nome']}" if conta else "Categoria removida"
-        linhas.append({"categoria": rotulo, "total": total})
-    linhas.sort(key=lambda r: r["total"], reverse=True)
-    return linhas
+    df = conn.query(
+        _CTE_RAIZ
+        + """
+        SELECT
+            (pc.codigo || ' - ' || pc.nome) AS categoria,
+            SUM(l.valor) AS total
+        FROM lancamentos l
+        JOIN plano_contas pc ON pc.id_conta = l.id_conta_plano
+        JOIN raiz_final rf ON rf.id_conta_original = l.id_conta_plano
+        WHERE to_char(l.data, 'YYYY-MM') = :ano_mes
+          AND rf.codigo != '1'
+        GROUP BY pc.id_conta, pc.codigo, pc.nome
+        ORDER BY total DESC
+        """,
+        params={"ano_mes": ano_mes},
+        ttl=0,
+    )
+    return _para_registros(df, colunas_numericas=("total",))
