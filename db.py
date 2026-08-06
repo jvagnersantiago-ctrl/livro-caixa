@@ -39,14 +39,15 @@ def _conectar():
     # a função levantar a exceção normalmente — ver versão original abaixo.
     # =====================================================================
     try:
-                return psycopg2.connect(
-        host=st.secrets["host"],
-        database=st.secrets["database"],
-        user=st.secrets["user"],
-        password=st.secrets["password"],
-        port=st.secrets["port"],
+    return psycopg2.connect(
+        host=st.secrets["connections"]["postgresql"]["host"],
+        database=st.secrets["connections"]["postgresql"]["database"],
+        user=st.secrets["connections"]["postgresql"]["user"],
+        password=st.secrets["connections"]["postgresql"]["password"],
+        port=st.secrets["connections"]["postgresql"]["port"],
         sslmode="require"
     )
+
 
 
     except Exception as e:
