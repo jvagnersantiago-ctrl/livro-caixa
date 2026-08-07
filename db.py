@@ -25,26 +25,8 @@ mesmo sem relação nenhuma com o erro original.
 from __future__ import annotations
 
 import psycopg2
+import psycopg2.extras
 import streamlit as st
-
-def _conectar():
-    return psycopg2.connect(
-        host=st.secrets["connections"]["postgresql"]["host"],
-        database=st.secrets["connections"]["postgresql"]["database"],
-        user=st.secrets["connections"]["postgresql"]["user"],
-        password=st.secrets["connections"]["postgresql"]["password"],
-        port=st.secrets["connections"]["postgresql"]["port"],
-        sslmode="require",
-        options="-c search_path=public"
-    )
-
-def get_connection():
-    return _conectar()
-
-
-
-
-
 
 
 @st.cache_resource
