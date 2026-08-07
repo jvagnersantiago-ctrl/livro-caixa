@@ -308,6 +308,8 @@ elif pagina == "Lançamentos":
                 st.session_state["lancamento_excluindo"] = l["id"]
                 st.session_state["lancamento_editando"] = None
                 st.rerun()
+            if l["descricao"]:
+                st.caption(f"📝 {l['descricao']}")
 
         # --- Formulário de edição ---
         if st.session_state["lancamento_editando"] is not None:
