@@ -28,19 +28,19 @@ import psycopg2
 import streamlit as st
 
 def _conectar():
-    # Parâmetros oficiais com o ID do projeto ajustado para o pooler do Supabase
     return psycopg2.connect(
-        host="://supabase.com",
-        database="postgres",
-        user="postgres|uyqthqevmajrdctdpcuc", 
-        password="dessantcaixalivro",
-        port=6543,
+        host=st.secrets["connections"]["postgresql"]["host"],
+        database=st.secrets["connections"]["postgresql"]["database"],
+        user=st.secrets["connections"]["postgresql"]["user"],
+        password=st.secrets["connections"]["postgresql"]["password"],
+        port=st.secrets["connections"]["postgresql"]["port"],
         sslmode="require",
         options="-c search_path=public"
     )
 
 def get_connection():
     return _conectar()
+
 
 
 
