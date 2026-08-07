@@ -45,6 +45,7 @@ def _conectar():
             user=st.secrets["connections"]["postgresql"]["user"],
             password=st.secrets["connections"]["postgresql"]["password"],
             port=st.secrets["connections"]["postgresql"]["port"],
+            sslmode="require",
         )
     except Exception as e:
         st.error(f"Falha ao conectar no banco:\n\n{e}")
