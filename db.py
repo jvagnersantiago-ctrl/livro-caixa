@@ -25,8 +25,22 @@ mesmo sem relação nenhuma com o erro original.
 from __future__ import annotations
 
 import psycopg2
-import psycopg2.extras
 import streamlit as st
+
+def _conectar():
+    # Injetando os identificadores oficiais exigidos pelo novo Pooler do Supabase
+    return psycopg2.connect(
+        host="aws-0-sa-east-1.pooler.supabase.com",
+        database="postgres",
+        user="postgres.uyqthqevmajrdctdpcuc",
+        password="dessantcaixalivro",
+        port=6543,
+        sslmode="require"
+    )
+
+def get_connection():
+    return _conectar()
+
 
 
 @st.cache_resource
