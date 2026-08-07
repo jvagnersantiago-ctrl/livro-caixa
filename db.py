@@ -115,6 +115,75 @@ def _normalizar(
 
 
 # ---------------------------------------------------------------------
+# Usuários (login + perfil com CPF/CNPJ pra segregação de lançamentos)
+# ---------------------------------------------------------------------
+
+def autenticar(conn, nome: str, senha_hash: str):
+    """Devolve o usuário (dict) se nome+hash baterem, senão None."""
+    linhas = _consultar(
+        conn,
+        "SELECT id_usuario, nome, cpf_cnpj, is_admin FROM usuarios "
+        "WHERE nome = %(nome)s AND senha_hash = %(senha_hash)s",
+        {"nome": nome, "senha_hash": senha_hash},
+    )
+    return linhas[0] if linhas else None
+
+
+def listar_usuarios(conn):
+    return _consultar(
+        conn,
+        "SELECT id_usuario, nome, cpf_cnpj, is_admin FROM usuarios ORDER BY nome",
+    )
+
+
+def buscar_usuario_por_id(conn, id_usuario: int):
+    linhas = _consultar(
+        conn,
+        "SELECT id_usuario, nome, cpf_cnpj, is_admin FROM usuarios WHERE id_usuario = %(id)s",
+        {"id": id_usuario},
+    )
+    return linhas[0] if linhas else None
+
+
+def inserir_usuario(conn, nome: str, senha_hash: str, cpf_cnpj, is_admin: bool) -> None:
+    """Levanta psycopg2.IntegrityError se já existir usuário com esse nome."""
+    _executar_escrita(
+        conn,
+        "INSERT INTO usuarios (nome, senha_hash, cpf_cnpj, is_admin) "
+        "VALUES (%(nome)s, %(senha_hash)s, %(cpf_cnpj)s, %(is_admin)s)",
+        {"nome": nome, "senha_hash": senha_hash, "cpf_cnpj": cpf_cnpj, "is_admin": is_admin},
+    )
+
+
+def atualizar_usuario(conn, id_usuario, nome, senha_hash, cpf_cnpj, is_admin) -> None:
+    """
+    senha_hash=None mantém a senha atual (usado quando o admin edita o
+    usuário sem preencher o campo de nova senha).
+    """
+    if senha_hash is None:
+        _executar_escrita(
+            conn,
+            "UPDATE usuarios SET nome = %(nome)s, cpf_cnpj = %(cpf_cnpj)s, is_admin = %(is_admin)s "
+            "WHERE id_usuario = %(id)s",
+            {"id": id_usuario, "nome": nome, "cpf_cnpj": cpf_cnpj, "is_admin": is_admin},
+        )
+    else:
+        _executar_escrita(
+            conn,
+            "UPDATE usuarios SET nome = %(nome)s, senha_hash = %(senha_hash)s, "
+            "cpf_cnpj = %(cpf_cnpj)s, is_admin = %(is_admin)s WHERE id_usuario = %(id)s",
+            {"id": id_usuario, "nome": nome, "senha_hash": senha_hash,
+             "cpf_cnpj": cpf_cnpj, "is_admin": is_admin},
+        )
+
+
+def excluir_usuario(conn, id_usuario: int) -> None:
+    """Levanta psycopg2.IntegrityError se houver lançamentos vinculados
+    a este usuário como titular."""
+    _executar_escrita(conn, "DELETE FROM usuarios WHERE id_usuario = %(id)s", {"id": id_usuario})
+
+
+# ---------------------------------------------------------------------
 # Clientes
 # ---------------------------------------------------------------------
 
@@ -238,28 +307,30 @@ def excluir_conta(conn, id_conta: int) -> None:
 
 def inserir_lancamento(
     conn, data, tipo, valor, forma_pagamento, descricao, id_cliente, id_conta_plano,
-    id_transacao_banco=None,
+    id_usuario_titular, id_transacao_banco=None,
 ) -> None:
     _executar_escrita(
         conn,
         """
         INSERT INTO lancamentos
             (data, tipo, valor, forma_pagamento, descricao,
-             id_cliente, id_conta_plano, id_transacao_banco)
+             id_cliente, id_conta_plano, id_usuario_titular, id_transacao_banco)
         VALUES
             (%(data)s, %(tipo)s, %(valor)s, %(forma_pagamento)s, %(descricao)s,
-             %(id_cliente)s, %(id_conta_plano)s, %(id_transacao_banco)s)
+             %(id_cliente)s, %(id_conta_plano)s, %(id_usuario_titular)s, %(id_transacao_banco)s)
         """,
         {"data": data, "tipo": tipo, "valor": valor, "forma_pagamento": forma_pagamento,
          "descricao": descricao, "id_cliente": id_cliente, "id_conta_plano": id_conta_plano,
-         "id_transacao_banco": id_transacao_banco},
+         "id_usuario_titular": id_usuario_titular, "id_transacao_banco": id_transacao_banco},
     )
 
 
-def listar_lancamentos(conn):
-    linhas = _consultar(
-        conn,
-        """
+def listar_lancamentos(conn, id_usuario_titular=None):
+    """
+    id_usuario_titular=None -> todos os lançamentos (uso de admin).
+    Um id específico -> só os lançamentos daquele titular.
+    """
+    sql = """
         SELECT
             l.id_lancamento AS id,
             l.data,
@@ -268,13 +339,20 @@ def listar_lancamentos(conn):
             l.forma_pagamento,
             l.descricao,
             c.nome AS cliente,
-            (pc.codigo || ' - ' || pc.nome) AS categoria
+            (pc.codigo || ' - ' || pc.nome) AS categoria,
+            u.nome AS titular
         FROM lancamentos l
         LEFT JOIN clientes c ON l.id_cliente = c.id_cliente
         JOIN plano_contas pc ON l.id_conta_plano = pc.id_conta
-        ORDER BY l.data DESC, l.id_lancamento DESC
-        """,
-    )
+        LEFT JOIN usuarios u ON l.id_usuario_titular = u.id_usuario
+    """
+    params = {}
+    if id_usuario_titular is not None:
+        sql += " WHERE l.id_usuario_titular = %(titular)s"
+        params["titular"] = id_usuario_titular
+    sql += " ORDER BY l.data DESC, l.id_lancamento DESC"
+
+    linhas = _consultar(conn, sql, params)
     return _normalizar(linhas, colunas_numericas=("valor",), colunas_data=("data",))
 
 
@@ -283,7 +361,7 @@ def buscar_lancamento_por_id(conn, id_lancamento: int):
         conn,
         """
         SELECT id_lancamento, data, tipo, valor, forma_pagamento, descricao,
-               id_cliente, id_conta_plano, id_transacao_banco
+               id_cliente, id_conta_plano, id_usuario_titular, id_transacao_banco
         FROM lancamentos WHERE id_lancamento = %(id)s
         """,
         {"id": id_lancamento},
@@ -294,18 +372,21 @@ def buscar_lancamento_por_id(conn, id_lancamento: int):
 
 def atualizar_lancamento(
     conn, id_lancamento, data, tipo, valor, forma_pagamento, descricao, id_cliente, id_conta_plano,
+    id_usuario_titular,
 ) -> None:
     _executar_escrita(
         conn,
         """
         UPDATE lancamentos
         SET data = %(data)s, tipo = %(tipo)s, valor = %(valor)s, forma_pagamento = %(forma_pagamento)s,
-            descricao = %(descricao)s, id_cliente = %(id_cliente)s, id_conta_plano = %(id_conta_plano)s
+            descricao = %(descricao)s, id_cliente = %(id_cliente)s, id_conta_plano = %(id_conta_plano)s,
+            id_usuario_titular = %(id_usuario_titular)s
         WHERE id_lancamento = %(id)s
         """,
         {"id": id_lancamento, "data": data, "tipo": tipo, "valor": valor,
          "forma_pagamento": forma_pagamento, "descricao": descricao,
-         "id_cliente": id_cliente, "id_conta_plano": id_conta_plano},
+         "id_cliente": id_cliente, "id_conta_plano": id_conta_plano,
+         "id_usuario_titular": id_usuario_titular},
     )
 
 
@@ -334,9 +415,8 @@ _CTE_RAIZ = """
 """
 
 
-def buscar_totais_dre(conn):
-    linhas = _consultar(
-        conn,
+def buscar_totais_dre(conn, id_usuario_titular=None):
+    sql = (
         _CTE_RAIZ
         + """
         SELECT
@@ -346,24 +426,32 @@ def buscar_totais_dre(conn):
             SUM(l.valor) AS total
         FROM lancamentos l
         JOIN raiz_final rf ON rf.id_conta_original = l.id_conta_plano
-        GROUP BY ano_mes, rf.codigo, rf.nome
-        ORDER BY ano_mes, rf.codigo
-        """,
+        """
     )
+    params = {}
+    if id_usuario_titular is not None:
+        sql += " WHERE l.id_usuario_titular = %(titular)s"
+        params["titular"] = id_usuario_titular
+    sql += " GROUP BY ano_mes, rf.codigo, rf.nome ORDER BY ano_mes, rf.codigo"
+
+    linhas = _consultar(conn, sql, params)
     return _normalizar(linhas, colunas_numericas=("total",))
 
 
-def listar_meses_disponiveis(conn):
-    linhas = _consultar(
-        conn,
-        "SELECT DISTINCT to_char(data, 'YYYY-MM') AS ano_mes FROM lancamentos ORDER BY 1",
-    )
+def listar_meses_disponiveis(conn, id_usuario_titular=None):
+    sql = "SELECT DISTINCT to_char(data, 'YYYY-MM') AS ano_mes FROM lancamentos"
+    params = {}
+    if id_usuario_titular is not None:
+        sql += " WHERE id_usuario_titular = %(titular)s"
+        params["titular"] = id_usuario_titular
+    sql += " ORDER BY 1"
+
+    linhas = _consultar(conn, sql, params)
     return [l["ano_mes"] for l in linhas]
 
 
-def buscar_despesas_por_categoria(conn, ano_mes: str):
-    linhas = _consultar(
-        conn,
+def buscar_despesas_por_categoria(conn, ano_mes: str, id_usuario_titular=None):
+    sql = (
         _CTE_RAIZ
         + """
         SELECT
@@ -374,9 +462,13 @@ def buscar_despesas_por_categoria(conn, ano_mes: str):
         JOIN raiz_final rf ON rf.id_conta_original = l.id_conta_plano
         WHERE to_char(l.data, 'YYYY-MM') = %(ano_mes)s
           AND rf.codigo != '1'
-        GROUP BY pc.id_conta, pc.codigo, pc.nome
-        ORDER BY total DESC
-        """,
-        {"ano_mes": ano_mes},
+        """
     )
+    params = {"ano_mes": ano_mes}
+    if id_usuario_titular is not None:
+        sql += " AND l.id_usuario_titular = %(titular)s"
+        params["titular"] = id_usuario_titular
+    sql += " GROUP BY pc.id_conta, pc.codigo, pc.nome ORDER BY total DESC"
+
+    linhas = _consultar(conn, sql, params)
     return _normalizar(linhas, colunas_numericas=("total",))

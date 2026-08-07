@@ -1,8 +1,9 @@
 """
 Interface Streamlit para o Livro Caixa.
 Rodar com: streamlit run app.py
-Requer que o schema já esteja criado no Supabase (schema_postgres.sql,
-rodado uma vez no SQL Editor) e as credenciais em .streamlit/secrets.toml.
+Requer que o schema já esteja criado no Supabase (schema_postgres.sql +
+migracao_usuarios.sql, rodados uma vez no SQL Editor) e as credenciais
+em .streamlit/secrets.toml.
 """
 
 import hashlib
@@ -21,20 +22,12 @@ st.set_page_config(page_title="Livro Caixa", page_icon="💰", layout="wide")
 # =======================================================================
 # AUTENTICAÇÃO
 # =======================================================================
-# Credenciais fixas pra início. As senhas ficam como HASH (SHA-256), não
-# em texto puro — mesmo assim, isso é autenticação básica, não segurança
-# de produção. Antes de publicar online com dados reais de cliente,
-# mova isso pra st.secrets (secrets.toml, fora do controle de versão).
+# Usuários agora vêm do banco (tabela 'usuarios'), não mais de um
+# dicionário fixo no código. Senhas ficam como HASH (SHA-256) — mesmo
+# assim, isso é autenticação básica, não segurança de produção.
 
 def _hash_senha(senha: str) -> str:
     return hashlib.sha256(senha.encode("utf-8")).hexdigest()
-
-
-USUARIOS = {
-    "admin": _hash_senha("admin123"),
-    # TROCAR ANTES DE USAR: nome de usuário e senha reais da sua esposa.
-    "usuario_2": _hash_senha("troque-esta-senha"),
-}
 
 
 def tela_login() -> None:
@@ -46,17 +39,18 @@ def tela_login() -> None:
         entrar = st.form_submit_button("Entrar")
 
         if entrar:
-            hash_informado = _hash_senha(senha)
-            if usuario in USUARIOS and USUARIOS[usuario] == hash_informado:
+            conn_login = db.get_connection()
+            perfil = db.autenticar(conn_login, usuario, _hash_senha(senha))
+            if perfil:
                 st.session_state["autenticado"] = True
-                st.session_state["usuario_logado"] = usuario
+                st.session_state["usuario_atual"] = perfil
                 st.rerun()
             else:
                 st.error("Usuário ou senha incorretos.")
 
 
 st.session_state.setdefault("autenticado", False)
-st.session_state.setdefault("usuario_logado", None)
+st.session_state.setdefault("usuario_atual", None)
 
 if not st.session_state["autenticado"]:
     # Nada abaixo desta linha roda sem login: nem menu, nem conexão
@@ -65,11 +59,8 @@ if not st.session_state["autenticado"]:
     st.stop()
 
 # ---- A partir daqui, o usuário já está autenticado ----
+usuario_atual = st.session_state["usuario_atual"]
 
-# Não existe mais um "inicializar_banco()" automático: a API REST do
-# Supabase não roda CREATE TABLE. O schema já foi criado uma vez direto
-# no SQL Editor (schema_postgres.sql) — se as tabelas não existirem lá,
-# é isso que precisa ser rodado, não algo que o app possa resolver sozinho.
 conn = db.get_connection()
 
 FORMAS_PAGAMENTO = [
@@ -83,21 +74,162 @@ def formatar_moeda(valor: float) -> str:
     return f"R$ {texto}"
 
 
-st.sidebar.markdown(f"👤 Logado como **{st.session_state['usuario_logado']}**")
+def selecionar_titular(todos_usuarios, key: str):
+    """
+    Se o usuário logado for admin, mostra um seletor 'Todos' + cada
+    perfil cadastrado e devolve o id escolhido (None = todos).
+    Se não for admin, devolve sempre o próprio id, sem mostrar nada —
+    cada pessoa só vê o próprio livro, sem escolha.
+    """
+    if not usuario_atual["is_admin"]:
+        return usuario_atual["id_usuario"]
+
+    opcoes = {"Todos": None}
+    for u in todos_usuarios:
+        rotulo = u["nome"] + (f" ({u['cpf_cnpj']})" if u["cpf_cnpj"] else "")
+        opcoes[rotulo] = u["id_usuario"]
+    escolha = st.selectbox("Ver dados de:", list(opcoes.keys()), key=key)
+    return opcoes[escolha]
+
+
+rotulo_cpf = f" · {usuario_atual['cpf_cnpj']}" if usuario_atual.get("cpf_cnpj") else ""
+st.sidebar.markdown(f"👤 Logado como **{usuario_atual['nome']}**{rotulo_cpf}")
 if st.sidebar.button("Sair"):
     st.session_state["autenticado"] = False
-    st.session_state["usuario_logado"] = None
+    st.session_state["usuario_atual"] = None
     st.rerun()
 st.sidebar.markdown("---")
 
-pagina = st.sidebar.radio(
-    "Navegação", ["Clientes", "Lançamentos", "Plano de Contas", "DRE", "Dashboard"]
-)
+opcoes_menu = ["Clientes", "Lançamentos", "Plano de Contas", "DRE", "Dashboard"]
+if usuario_atual["is_admin"]:
+    opcoes_menu.append("Usuários")
+pagina = st.sidebar.radio("Navegação", opcoes_menu)
+
+# =======================================================================
+# ABA USUÁRIOS (só admin)
+# =======================================================================
+if pagina == "Usuários":
+    st.header("Usuários")
+
+    with st.expander("➕ Cadastrar novo usuário"):
+        with st.form("form_usuario", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+            nome_u = col1.text_input("Nome *")
+            cpf_cnpj_u = col2.text_input("CPF ou CNPJ")
+            senha_u = col1.text_input("Senha *", type="password")
+            admin_u = col2.checkbox("É administrador (vê todos os dados)")
+            enviado_u = st.form_submit_button("Cadastrar Usuário")
+
+            if enviado_u:
+                if not nome_u.strip() or not senha_u:
+                    st.error("Nome e senha são obrigatórios.")
+                else:
+                    try:
+                        db.inserir_usuario(
+                            conn, nome_u.strip(), _hash_senha(senha_u),
+                            cpf_cnpj_u.strip() or None, admin_u,
+                        )
+                        st.success(f"Usuário '{nome_u}' cadastrado.")
+                        st.rerun()
+                    except psycopg2.IntegrityError:
+                        st.error("Já existe um usuário com esse nome.")
+
+    st.subheader("Usuários cadastrados")
+    usuarios = db.listar_usuarios(conn)
+
+    st.session_state.setdefault("usuario_editando", None)
+    st.session_state.setdefault("usuario_excluindo", None)
+
+    cabecalho = st.columns([3, 2, 1.5, 1, 1])
+    for col, titulo in zip(cabecalho, ["Nome", "CPF/CNPJ", "Admin?", "", ""]):
+        col.markdown(f"**{titulo}**")
+
+    for u in usuarios:
+        linha = st.columns([3, 2, 1.5, 1, 1])
+        linha[0].write(u["nome"])
+        linha[1].write(u["cpf_cnpj"] or "—")
+        linha[2].write("✅" if u["is_admin"] else "—")
+        if linha[3].button("✏️", key=f"editar_usuario_{u['id_usuario']}"):
+            st.session_state["usuario_editando"] = u["id_usuario"]
+            st.session_state["usuario_excluindo"] = None
+            st.rerun()
+        if linha[4].button("🗑️", key=f"excluir_usuario_{u['id_usuario']}"):
+            st.session_state["usuario_excluindo"] = u["id_usuario"]
+            st.session_state["usuario_editando"] = None
+            st.rerun()
+
+    if st.session_state["usuario_editando"] is not None:
+        registro = db.buscar_usuario_por_id(conn, st.session_state["usuario_editando"])
+        st.markdown("---")
+        st.subheader(f"Editando: {registro['nome']}")
+        with st.form("form_editar_usuario"):
+            col1, col2 = st.columns(2)
+            nome_e = col1.text_input("Nome *", value=registro["nome"])
+            cpf_cnpj_e = col2.text_input("CPF ou CNPJ", value=registro["cpf_cnpj"] or "")
+            senha_e = col1.text_input(
+                "Nova senha (deixe em branco pra manter a atual)", type="password"
+            )
+            admin_e = col2.checkbox("É administrador (vê todos os dados)", value=registro["is_admin"])
+
+            col_salvar, col_cancelar = st.columns(2)
+            salvar_u = col_salvar.form_submit_button("Salvar Alterações")
+            cancelar_u = col_cancelar.form_submit_button("Cancelar")
+
+            if salvar_u:
+                admins_restantes = sum(1 for u in usuarios if u["is_admin"] and u["id_usuario"] != registro["id_usuario"])
+                if registro["is_admin"] and not admin_e and admins_restantes == 0:
+                    st.error("Não é possível remover o último administrador do sistema.")
+                elif not nome_e.strip():
+                    st.error("Informe o nome do usuário.")
+                else:
+                    try:
+                        db.atualizar_usuario(
+                            conn, registro["id_usuario"], nome_e.strip(),
+                            _hash_senha(senha_e) if senha_e else None,
+                            cpf_cnpj_e.strip() or None, admin_e,
+                        )
+                        st.session_state["usuario_editando"] = None
+                        st.success("Usuário atualizado.")
+                        st.rerun()
+                    except psycopg2.IntegrityError:
+                        st.error("Já existe outro usuário com esse nome.")
+            if cancelar_u:
+                st.session_state["usuario_editando"] = None
+                st.rerun()
+
+    if st.session_state["usuario_excluindo"] is not None:
+        registro = db.buscar_usuario_por_id(conn, st.session_state["usuario_excluindo"])
+        st.markdown("---")
+        if registro["id_usuario"] == usuario_atual["id_usuario"]:
+            st.error("Você não pode excluir o usuário com o qual está logado agora.")
+            st.session_state["usuario_excluindo"] = None
+        else:
+            admins_restantes = sum(1 for u in usuarios if u["is_admin"] and u["id_usuario"] != registro["id_usuario"])
+            if registro["is_admin"] and admins_restantes == 0:
+                st.error("Não é possível excluir o último administrador do sistema.")
+                st.session_state["usuario_excluindo"] = None
+            else:
+                st.warning(f"Confirma a exclusão do usuário **{registro['nome']}**?")
+                col_confirmar, col_cancelar = st.columns(2)
+                if col_confirmar.button("Confirmar exclusão", type="primary"):
+                    try:
+                        db.excluir_usuario(conn, registro["id_usuario"])
+                        st.session_state["usuario_excluindo"] = None
+                        st.success("Usuário excluído.")
+                        st.rerun()
+                    except psycopg2.IntegrityError:
+                        st.error(
+                            "Não é possível excluir: este usuário tem lançamentos "
+                            "registrados como titular."
+                        )
+                if col_cancelar.button("Cancelar"):
+                    st.session_state["usuario_excluindo"] = None
+                    st.rerun()
 
 # =======================================================================
 # ABA CLIENTES
 # =======================================================================
-if pagina == "Clientes":
+elif pagina == "Clientes":
     st.header("Clientes")
 
     with st.expander("➕ Cadastrar novo cliente"):
@@ -112,9 +244,6 @@ if pagina == "Clientes":
 
             if enviado:
                 if not nome.strip():
-                    # O banco permite nome nulo, mas na prática um cliente
-                    # sem nome não serve pra nada em nenhum relatório —
-                    # essa validação é só de interface.
                     st.error("Informe o nome do cliente.")
                 else:
                     try:
@@ -159,7 +288,6 @@ if pagina == "Clientes":
                 st.session_state["cliente_editando"] = None
                 st.rerun()
 
-        # --- Formulário de edição, se algum cliente foi selecionado ---
         if st.session_state["cliente_editando"] is not None:
             registro = db.buscar_cliente_por_id(conn, st.session_state["cliente_editando"])
             st.markdown("---")
@@ -199,7 +327,6 @@ if pagina == "Clientes":
                     st.session_state["cliente_editando"] = None
                     st.rerun()
 
-        # --- Confirmação de exclusão, se algum cliente foi selecionado ---
         if st.session_state["cliente_excluindo"] is not None:
             registro = db.buscar_cliente_por_id(conn, st.session_state["cliente_excluindo"])
             st.markdown("---")
@@ -228,6 +355,7 @@ elif pagina == "Lançamentos":
 
     clientes = db.listar_clientes(conn)
     plano_contas = db.listar_plano_contas_folhas(conn)
+    todos_usuarios = db.listar_usuarios(conn)
 
     if not plano_contas:
         st.warning(
@@ -239,11 +367,10 @@ elif pagina == "Lançamentos":
         opcoes_cliente.update(
             {f"{c['nome']} ({c['cpf'] or 'sem CPF'})": c["id_cliente"] for c in clientes}
         )
-        # Só contas-folha aparecem aqui — vincular a uma conta-pai quebra
-        # a soma hierárquica usada na DRE e no Dashboard.
         opcoes_categoria = {
             f"{c['codigo']} - {c['nome']}": c["id_conta"] for c in plano_contas
         }
+        opcoes_titular = {u["nome"]: u["id_usuario"] for u in todos_usuarios}
 
         with st.expander("➕ Registrar novo lançamento"):
             with st.form("form_lancamento", clear_on_submit=True):
@@ -256,6 +383,15 @@ elif pagina == "Lançamentos":
                 forma_pagamento = col2.selectbox("Forma de Pagamento", FORMAS_PAGAMENTO)
                 cliente_sel = col1.selectbox("Cliente", list(opcoes_cliente.keys()))
                 categoria_sel = col2.selectbox("Categoria", list(opcoes_categoria.keys()))
+
+                if usuario_atual["is_admin"]:
+                    # Admin decide de quem é esse lançamento; os demais
+                    # perfis só lançam no próprio livro, sem escolha.
+                    titular_sel = col1.selectbox("Titular (de quem é este lançamento)", list(opcoes_titular.keys()))
+                    id_titular_novo = opcoes_titular[titular_sel]
+                else:
+                    id_titular_novo = usuario_atual["id_usuario"]
+
                 descricao = st.text_input("Descrição")
 
                 enviado = st.form_submit_button("Registrar Lançamento")
@@ -270,41 +406,52 @@ elif pagina == "Lançamentos":
                         descricao=descricao.strip() or None,
                         id_cliente=opcoes_cliente[cliente_sel],
                         id_conta_plano=opcoes_categoria[categoria_sel],
+                        id_usuario_titular=id_titular_novo,
                     )
                     st.success("Lançamento registrado.")
                     st.rerun()
 
     st.subheader("Histórico de Lançamentos")
-    lancamentos = db.listar_lancamentos(conn)
+    id_titular_filtro = selecionar_titular(todos_usuarios, key="titular_historico")
+    lancamentos = db.listar_lancamentos(conn, id_usuario_titular=id_titular_filtro)
 
     if not lancamentos:
         st.info("Nenhum lançamento registrado ainda.")
     elif not plano_contas:
-        # Sem plano de contas não dá pra montar os dropdowns de edição.
         df = pd.DataFrame(lancamentos, columns=lancamentos[0].keys())
         st.dataframe(df, width="stretch", hide_index=True)
     else:
         st.session_state.setdefault("lancamento_editando", None)
         st.session_state.setdefault("lancamento_excluindo", None)
 
-        cabecalho = st.columns([1.5, 1, 1.3, 1.5, 2.5, 2, 1, 1])
-        titulos = ["Data", "Tipo", "Valor", "Forma Pgto.", "Categoria", "Cliente", "", ""]
+        mostrar_titular = usuario_atual["is_admin"]
+        larguras = [1.4, 0.9, 1.2, 1.4, 2.2, 1.7] + ([1.3] if mostrar_titular else []) + [0.8, 0.8]
+        titulos = ["Data", "Tipo", "Valor", "Forma Pgto.", "Categoria", "Cliente"]
+        if mostrar_titular:
+            titulos.append("Titular")
+        titulos += ["", ""]
+
+        cabecalho = st.columns(larguras)
         for col, titulo in zip(cabecalho, titulos):
             col.markdown(f"**{titulo}**")
 
         for l in lancamentos:
-            linha = st.columns([1.5, 1, 1.3, 1.5, 2.5, 2, 1, 1])
+            linha = st.columns(larguras)
             linha[0].write(l["data"])
             linha[1].write(l["tipo"])
             linha[2].write(formatar_moeda(l["valor"]))
             linha[3].write(l["forma_pagamento"] or "—")
             linha[4].write(l["categoria"])
             linha[5].write(l["cliente"] or "—")
-            if linha[6].button("✏️", key=f"editar_lanc_{l['id']}"):
+            idx = 6
+            if mostrar_titular:
+                linha[idx].write(l["titular"] or "Sem titular")
+                idx += 1
+            if linha[idx].button("✏️", key=f"editar_lanc_{l['id']}"):
                 st.session_state["lancamento_editando"] = l["id"]
                 st.session_state["lancamento_excluindo"] = None
                 st.rerun()
-            if linha[7].button("🗑️", key=f"excluir_lanc_{l['id']}"):
+            if linha[idx + 1].button("🗑️", key=f"excluir_lanc_{l['id']}"):
                 st.session_state["lancamento_excluindo"] = l["id"]
                 st.session_state["lancamento_editando"] = None
                 st.rerun()
@@ -317,8 +464,10 @@ elif pagina == "Lançamentos":
 
             id_para_label_cliente = {v: k for k, v in opcoes_cliente.items()}
             id_para_label_categoria = {v: k for k, v in opcoes_categoria.items()}
+            id_para_label_titular = {v: k for k, v in opcoes_titular.items()}
             label_cliente_atual = id_para_label_cliente.get(registro["id_cliente"], "Nenhum")
             label_categoria_atual = id_para_label_categoria.get(registro["id_conta_plano"])
+            label_titular_atual = id_para_label_titular.get(registro["id_usuario_titular"])
 
             st.markdown("---")
             st.subheader(f"Editando lançamento #{registro['id_lancamento']}")
@@ -356,6 +505,19 @@ elif pagina == "Lançamentos":
                 categoria_sel_edit = col2.selectbox(
                     "Categoria", list(opcoes_categoria.keys()), index=indice_categoria
                 )
+
+                if usuario_atual["is_admin"]:
+                    indice_titular = (
+                        list(opcoes_titular.keys()).index(label_titular_atual)
+                        if label_titular_atual in opcoes_titular else 0
+                    )
+                    titular_sel_edit = col1.selectbox(
+                        "Titular", list(opcoes_titular.keys()), index=indice_titular
+                    )
+                    id_titular_edit = opcoes_titular[titular_sel_edit]
+                else:
+                    id_titular_edit = usuario_atual["id_usuario"]
+
                 descricao_edit = st.text_input("Descrição", value=registro["descricao"] or "")
 
                 col_salvar, col_cancelar = st.columns(2)
@@ -373,6 +535,7 @@ elif pagina == "Lançamentos":
                         descricao=descricao_edit.strip() or None,
                         id_cliente=opcoes_cliente[cliente_sel_edit],
                         id_conta_plano=opcoes_categoria[categoria_sel_edit],
+                        id_usuario_titular=id_titular_edit,
                     )
                     st.session_state["lancamento_editando"] = None
                     st.success("Lançamento atualizado.")
@@ -412,8 +575,6 @@ elif pagina == "Plano de Contas":
     if not todas_contas:
         st.info("Nenhuma conta cadastrada ainda.")
     else:
-        # Monta a árvore em memória (id -> filhos) e imprime por
-        # indentação, ordenado pelo código.
         filhos_de = {}
         contas_por_id = {}
         for c in todas_contas:
@@ -450,13 +611,10 @@ elif pagina == "Plano de Contas":
             id_pai_sel = opcoes_pai[pai_sel]
 
             if id_pai_sel is None:
-                # Conta raiz nova: natureza precisa ser escolhida.
                 natureza_sel = st.radio(
                     "Natureza", ["Receita", "Despesa"], horizontal=True
                 )
             else:
-                # Subconta herda a natureza do pai — evita uma subconta de
-                # Despesas nascer classificada como Receita por engano.
                 natureza_sel = next(
                     c["natureza"] for c in todas_contas if c["id_conta"] == id_pai_sel
                 )
@@ -505,21 +663,20 @@ elif pagina == "Plano de Contas":
 elif pagina == "DRE":
     st.header("DRE — Demonstração do Resultado do Exercício")
 
-    totais = db.buscar_totais_dre(conn)
+    todos_usuarios = db.listar_usuarios(conn)
+    id_titular_filtro = selecionar_titular(todos_usuarios, key="titular_dre")
+
+    totais = db.buscar_totais_dre(conn, id_usuario_titular=id_titular_filtro)
 
     if not totais:
         st.info("Ainda não há lançamentos suficientes para montar a DRE.")
     else:
-        # Reorganiza os totais em: {ano_mes: {raiz_codigo: total}}
         por_mes: dict[str, dict[str, float]] = {}
         for linha in totais:
             por_mes.setdefault(linha["ano_mes"], {})[linha["raiz_codigo"]] = linha["total"]
 
         meses_ordenados = sorted(por_mes.keys())
 
-        # Códigos raiz definidos no plano de contas padrão inserido em
-        # criar_banco.py: 1=Receitas, 2=Despesas Fixas,
-        # 3=Despesas Variáveis, 4=Impostos.
         linhas_dre = []
         for ano_mes in meses_ordenados:
             valores = por_mes[ano_mes]
@@ -560,17 +717,17 @@ elif pagina == "DRE":
 else:
     st.header("Dashboard Financeiro")
 
-    meses = db.listar_meses_disponiveis(conn)
+    todos_usuarios = db.listar_usuarios(conn)
+    id_titular_filtro = selecionar_titular(todos_usuarios, key="titular_dashboard")
+
+    meses = db.listar_meses_disponiveis(conn, id_usuario_titular=id_titular_filtro)
 
     if not meses:
         st.info("Ainda não há lançamentos para montar o dashboard.")
     else:
         mes_selecionado = st.selectbox("Mês de referência", meses, index=len(meses) - 1)
 
-        # Reaproveita a mesma agregação da DRE — assim "Total de Despesas"
-        # aqui é exatamente igual a "(-) Despesas" + "(-) Impostos" da DRE,
-        # e "Saldo" bate com o "(=) Resultado Líquido".
-        totais = db.buscar_totais_dre(conn)
+        totais = db.buscar_totais_dre(conn, id_usuario_titular=id_titular_filtro)
         por_mes: dict[str, dict[str, float]] = {}
         for linha in totais:
             por_mes.setdefault(linha["ano_mes"], {})[linha["raiz_codigo"]] = linha["total"]
@@ -615,7 +772,9 @@ else:
         st.plotly_chart(fig_barras, width="stretch")
 
         st.subheader(f"Distribuição das Despesas por Categoria — {mes_selecionado}")
-        despesas_categoria = db.buscar_despesas_por_categoria(conn, mes_selecionado)
+        despesas_categoria = db.buscar_despesas_por_categoria(
+            conn, mes_selecionado, id_usuario_titular=id_titular_filtro
+        )
         if despesas_categoria:
             df_pizza = pd.DataFrame(despesas_categoria, columns=despesas_categoria[0].keys())
             fig_pizza = px.pie(df_pizza, names="categoria", values="total", hole=0.4)
